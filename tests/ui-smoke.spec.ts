@@ -20,7 +20,7 @@ async function closeInstallGuideIfVisible(page: Page) {
 async function goTo(page: Page, label: string) {
   await closeInstallGuideIfVisible(page);
   await page.getByRole("menuitem", { name: new RegExp(label) }).click();
-  await expect(page.getByRole("heading", { name: label })).toBeVisible();
+  await expect(page.getByRole("banner").getByRole("heading", { name: label })).toBeVisible();
 }
 
 test("overview and first install guide are usable", async ({ page }) => {
@@ -65,7 +65,7 @@ test("network, environment and diagnostics flows expose v1 controls", async ({ p
   await openApp(page);
 
   await goTo(page, "网络与设置");
-  await expect(page.getByText("源码源")).toBeVisible();
+  await expect(page.getByRole("tab", { name: "源码源" })).toBeVisible();
   await page.getByRole("button", { name: "探测 GitHub / CNB" }).click();
   await expect(page.getByText("CNB 国内镜像")).toBeVisible();
 
