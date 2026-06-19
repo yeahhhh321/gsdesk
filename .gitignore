@@ -17,13 +17,20 @@ __pycache__/
 node_modules/
 dist/
 build/
+test-results/
+playwright-report/
 
 # Rust / Tauri
 target/
+src-tauri/gen/
 
 # Local app/runtime data
 .gsdesk/
 data/
 runtime/
 downloads/
+release-assets/
 
+# IDE
+.idea/
+.vscode/

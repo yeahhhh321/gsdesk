@@ -1,0 +1,40 @@
+{
+  "name": "gsdesk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 1420",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "bundle:windows": "tauri build --bundles nsis",
+    "bundle:mac": "tauri build --bundles app,dmg",
+    "verify": "pnpm build && pnpm verify:security && pnpm verify:bundle-config && cargo test --manifest-path src-tauri/Cargo.toml && pnpm tauri build --no-bundle",
+    "verify:security": "node scripts/verify-security.mjs",
+    "verify:bundle-config": "node scripts/verify-bundle-config.mjs",
+    "verify:release-assets": "node scripts/verify-release-assets.mjs",
+    "verify:e2e": "node scripts/e2e-3rounds.mjs",
+    "test:ui": "playwright test",
+    "smoke:core": "node scripts/smoke-core.mjs",
+    "smoke:desktop": "node scripts/smoke-desktop.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0",
+    "antd": "^6.0.0",
+    "lucide-react": "^0.561.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.0",
+    "@tauri-apps/cli": "^2.9.0",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.0"
+  }
+}

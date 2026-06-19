@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            bundles: nsis
+            artifact: windows
+          - os: macos-latest
+            bundles: app,dmg
+            artifact: macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Security config check
+        run: pnpm verify:security
+      - name: Bundle config check
+        run: pnpm verify:bundle-config
+      - name: Install Playwright browser
+        run: pnpm exec playwright install chromium
+      - name: UI smoke
+        run: pnpm test:ui
+      - name: Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Build Tauri bundle
+        run: pnpm tauri build --bundles ${{ matrix.bundles }}
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets
+          Get-ChildItem src-tauri/target/release/bundle -Recurse -File |
+            Where-Object { $_.Extension -in ".exe", ".msi", ".dmg", ".zip" } |
+            ForEach-Object { Copy-Item $_.FullName release-assets/ }
+          Get-ChildItem src-tauri/target/release/bundle -Recurse -Directory |
+            Where-Object { $_.Name.EndsWith(".app") } |
+            ForEach-Object { Compress-Archive -Path $_.FullName -DestinationPath "release-assets/$($_.Name).zip" -Force }
+      - name: Verify release assets
+        run: pnpm verify:release-assets -- --dir release-assets --platform ${{ matrix.artifact }} --write
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gsdesk-${{ matrix.artifact }}
+          path: release-assets/*
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+          files: release-assets/*
