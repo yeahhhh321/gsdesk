@@ -32,6 +32,9 @@ export default defineConfig({
     strictPort: true,
     host: "127.0.0.1",
     port: 1420,
+    watch: {
+      ignored: ["**/src-tauri/runtime-assets/**", "**/src-tauri/target/debug/runtime-assets/**"],
+    },
   },
   envPrefix: ["VITE_", "TAURI_"],
 });

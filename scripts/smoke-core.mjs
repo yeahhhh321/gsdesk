@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
+const root = process.cwd();
 const args = parseArgs(process.argv.slice(2));
 const port = Number(args.port || 8875);
 const timeoutMs = Number(args.timeout || 90) * 1000;
@@ -12,13 +13,14 @@ const runtimeDir = resolve(coreDir, "..", "..");
 const venvDir = resolve(args.venvDir || join(runtimeDir, "venvs", "gsuid_core"));
 const uvCacheDir = resolve(args.uvCacheDir || join(runtimeDir, "uv", "cache"));
 const uvPythonDir = resolve(args.uvPythonDir || join(runtimeDir, "uv", "python"));
+const gitProgram = resolveGitProgram(args.git);
 
 if (!existsSync(coreDir)) {
   if (!args.fresh) {
     throw new Error(`Core runtime does not exist: ${coreDir}. Pass --fresh to clone ${sourceUrl}.`);
   }
   mkdirSync(dirname(coreDir), { recursive: true });
-  await run("git", ["clone", "--depth", "1", sourceUrl, coreDir], { cwd: dirname(coreDir), timeoutMs: 300_000 });
+  await run(gitProgram, ["clone", "--depth", "1", sourceUrl, coreDir], { cwd: dirname(coreDir), timeoutMs: 300_000 });
 }
 
 if (!existsSync(join(coreDir, "pyproject.toml"))) {
@@ -47,6 +49,7 @@ delete env.PYTHONLEGACYWINDOWSSTDIO;
 
 console.log(`[smoke] coreDir=${coreDir}`);
 console.log(`[smoke] port=${port}`);
+console.log(`[smoke] git=${gitProgram}`);
 await run("uv", ["--version"], { cwd: coreDir, timeoutMs: 20_000, env });
 
 const child = spawn("uv", ["run", "--python", "3.12", "core", "--host", "127.0.0.1", "--port", String(port)], {
@@ -185,10 +188,26 @@ function createPrefixedSink(stream, prefix) {
 }
 
 function sanitizeTerminalText(text) {
-  return text.replace(/[\u2190-\u2BFF\uFE0E\uFE0F\u{1F000}-\u{1FAFF}]/gu, (value) => {
-    const codePoint = value.codePointAt(0)?.toString(16).toUpperCase().padStart(4, "0") || "FFFD";
-    return `\\u{${codePoint}}`;
-  });
+  return Array.from(text)
+    .map((value) => (isTerminalSensitiveChar(value) ? escapeCodePoint(value) : value))
+    .join("");
+}
+
+function isTerminalSensitiveChar(value) {
+  const codePoint = value.codePointAt(0);
+  if (codePoint === undefined) return false;
+  return (
+    codePoint === 0xfe0e ||
+    codePoint === 0xfe0f ||
+    (codePoint >= 0x2190 && codePoint <= 0x2bff) ||
+    (codePoint >= 0x1f000 && codePoint <= 0x1faff)
+  );
+}
+
+function escapeCodePoint(value) {
+  const codePoint = value.codePointAt(0);
+  if (codePoint === undefined) return "\\u{FFFD}";
+  return `\\u{${codePoint.toString(16).toUpperCase().padStart(4, "0")}}`;
 }
 
 async function stopTree(pid) {
@@ -266,12 +285,39 @@ function delay(ms) {
 function defaultCoreDir() {
   if (process.env.GSUID_CORE_DIR) return process.env.GSUID_CORE_DIR;
   if (process.platform === "win32") {
-    return join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "com.yeahhhh321.gsdesk", "runtime", "core", "gsuid_core");
+    return join(
+      process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
+      "com.yeahhhh321.gsdesk",
+      "runtime",
+      "core",
+      "gsuid_core",
+    );
   }
   if (process.platform === "darwin") {
     return join(homedir(), "Library", "Application Support", "com.yeahhhh321.gsdesk", "runtime", "core", "gsuid_core");
   }
   return join(tmpdir(), "gsdesk-runtime", "core", "gsuid_core");
+}
+
+function resolveGitProgram(configured) {
+  if (configured) return resolve(configured);
+  const runtimeGit = join(root, "src-tauri", "runtime-assets", "git");
+  for (const candidate of gitBinaryCandidates(runtimeGit)) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return "git";
+}
+
+function gitBinaryCandidates(dir) {
+  if (process.platform === "win32") {
+    return [
+      join(dir, "cmd", "git.exe"),
+      join(dir, "bin", "git.exe"),
+      join(dir, "mingw64", "bin", "git.exe"),
+      join(dir, "git.exe"),
+    ];
+  }
+  return [join(dir, "bin", "git"), join(dir, "cmd", "git"), join(dir, "git")];
 }
 
 function parseArgs(rawArgs) {

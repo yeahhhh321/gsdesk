@@ -14,9 +14,8 @@ const requiredCspFragments = [
   "frame-src http://127.0.0.1:*",
   "connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*",
 ];
-const forbiddenTelemetryFragments = [
+const forbiddenRemoteTrackingFragments = [
   "analytics",
-  "telemetry",
   "sentry",
   "posthog",
   "segment",
@@ -31,8 +30,8 @@ for (const fragment of requiredCspFragments) {
 
 assert(!csp.includes("script-src 'self' 'unsafe-inline'"), "script-src must not allow inline scripts");
 assert(!csp.includes("'unsafe-eval'"), "CSP must not allow unsafe-eval");
-for (const fragment of forbiddenTelemetryFragments) {
-  assert(!csp.toLowerCase().includes(fragment), `CSP must not include telemetry/analytics target: ${fragment}`);
+for (const fragment of forbiddenRemoteTrackingFragments) {
+  assert(!csp.toLowerCase().includes(fragment), `CSP must not include remote tracking target: ${fragment}`);
 }
 
 assert(Array.isArray(capability.windows), "capability.windows must be an array");

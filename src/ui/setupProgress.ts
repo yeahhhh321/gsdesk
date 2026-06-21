@@ -1,11 +1,7 @@
-import type {
-  AppState,
-  MirrorCheckResult,
-  ServiceSnapshot,
-  SourceProbeResult,
-} from "../types";
+import type { AppState, MirrorCheckResult, ServiceSnapshot, SourceProbeResult } from "../types";
+import { isFailedServiceStatus } from "./status";
 
-export interface SetupProgressContext {
+interface SetupProgressContext {
   appState?: AppState;
   core?: ServiceSnapshot;
   sourceResults: SourceProbeResult[];
@@ -19,20 +15,16 @@ export interface SetupProgressItem {
   error?: boolean;
 }
 
-export function getSetupProgress({
-  appState,
-  core,
-  sourceResults,
-  mirrorResults,
-}: SetupProgressContext): SetupProgressItem[] {
+export function getSetupProgress({ appState, core, sourceResults, mirrorResults }: SetupProgressContext): SetupProgressItem[] {
   const sourceReady = sourceResults.some((item) => item.ok);
   const mirrorReady = mirrorResults.some((item) => item.ok);
   const runtimeReady = Boolean(core && core.status !== "uninitialized");
   const running = core?.status === "running";
   const consoleReady = Boolean(core?.webconsoleAvailable);
-  const failed = core?.status === "failed" || core?.status === "crashed";
-  const blockers = appState?.preflightChecks.filter((check) => check.status === "block").length || 0;
-  const warnings = appState?.preflightChecks.filter((check) => check.status === "warn").length || 0;
+  const failed = isFailedServiceStatus(core?.status);
+  const preflightChecks = appState?.preflightChecks;
+  const blockers = preflightChecks ? preflightChecks.filter((check) => check.status === "block").length : 0;
+  const warnings = preflightChecks ? preflightChecks.filter((check) => check.status === "warn").length : 0;
 
   return [
     {
@@ -51,7 +43,7 @@ export function getSetupProgress({
     },
     {
       label: "启动 Core",
-      detail: running ? `端口 ${core?.port}` : "待启动",
+      detail: running ? `端口 ${core?.port ?? "未分配"}` : "待启动",
       done: running,
       error: failed,
     },

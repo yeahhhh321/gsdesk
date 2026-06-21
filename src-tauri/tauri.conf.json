@@ -27,27 +27,33 @@
   "bundle": {
     "active": true,
     "targets": ["nsis", "app", "dmg"],
+    "createUpdaterArtifacts": true,
     "publisher": "yeahhhh321",
     "homepage": "https://github.com/yeahhhh321/gsdesk",
     "license": "GPL-3.0-or-later",
     "category": "DeveloperTool",
     "shortDescription": "gsuid_core desktop runtime manager",
     "longDescription": "GSDesk helps Windows and macOS users initialize, run, repair, inspect logs, and open WebConsole for gsuid_core without using a terminal.",
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
-    ],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "resources": ["runtime-assets/"],
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "installerHooks": "windows/nsis-hooks.nsh"
       }
     },
     "macOS": {
       "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI1NUMxNTZENkQyMTU1MUYKUldRZlZTRnRiUlZjdFl1MVgrbHZkNm9FeHFmMlB1M2JOL1c4bFlua3l1L3p2NENSMm9qZVROalMK",
+      "endpoints": ["https://github.com/yeahhhh321/gsdesk/releases/latest/download/latest.json"],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

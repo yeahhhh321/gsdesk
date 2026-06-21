@@ -1,0 +1,14 @@
+dist
+node_modules
+src-tauri/target
+test-results
+playwright-report
+release-assets
+src-tauri/gen
+src-tauri/icons
+src-tauri/runtime-assets/manifest.json
+src-tauri/runtime-assets/git
+src-tauri/runtime-assets/python
+src-tauri/runtime-assets/uv/uv*
+pnpm-lock.yaml
+Cargo.lock

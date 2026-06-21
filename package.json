@@ -12,11 +12,18 @@
     "tauri:build": "tauri build",
     "bundle:windows": "tauri build --bundles nsis",
     "bundle:mac": "tauri build --bundles app,dmg",
+    "lint": "pnpm lint:ts && pnpm lint:rust",
+    "lint:ts": "eslint . --max-warnings=0",
+    "lint:rust": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings",
+    "format": "prettier . --write && cargo fmt --manifest-path src-tauri/Cargo.toml",
+    "format:check": "prettier . --check && cargo fmt --manifest-path src-tauri/Cargo.toml --check",
+    "precommit": "pnpm format:check && pnpm lint && pnpm build && cargo test --manifest-path src-tauri/Cargo.toml",
     "verify": "pnpm build && pnpm verify:security && pnpm verify:bundle-config && cargo test --manifest-path src-tauri/Cargo.toml && pnpm tauri build --no-bundle",
     "verify:security": "node scripts/verify-security.mjs",
     "verify:bundle-config": "node scripts/verify-bundle-config.mjs",
     "verify:release-assets": "node scripts/verify-release-assets.mjs",
     "verify:e2e": "node scripts/e2e-3rounds.mjs",
+    "prepare:runtime-assets": "node scripts/prepare-runtime-assets.mjs",
     "test:ui": "playwright test",
     "smoke:core": "node scripts/smoke-core.mjs",
     "smoke:desktop": "node scripts/smoke-desktop.mjs"
@@ -24,17 +31,23 @@
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",
     "antd": "^6.0.0",
-    "lucide-react": "^0.561.0",
+    "lucide-react": "^1.21.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@playwright/test": "^1.61.0",
     "@tauri-apps/cli": "^2.9.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^5.1.1",
-    "typescript": "^5.9.3",
-    "vite": "^7.3.0"
+    "@vitejs/plugin-react": "^6.0.2",
+    "eslint": "^10.5.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.6.0",
+    "prettier": "^3.8.4",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.61.1",
+    "vite": "^8.0.16"
   }
 }

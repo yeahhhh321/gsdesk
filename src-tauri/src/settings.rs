@@ -25,10 +25,7 @@ pub fn save_settings_file(settings_file: &Path, settings: &Settings) -> Result<(
 pub fn env_from_settings(settings: &Settings) -> Vec<(String, String)> {
     let mut envs = Vec::new();
     if !settings.pypi_index_url.trim().is_empty() {
-        envs.push((
-            "UV_DEFAULT_INDEX".to_string(),
-            settings.pypi_index_url.trim().to_string(),
-        ));
+        envs.push(("UV_DEFAULT_INDEX".to_string(), settings.pypi_index_url.trim().to_string()));
     }
     add_proxy_env(&mut envs, "HTTP_PROXY", &settings.proxy.http_proxy);
     add_proxy_env(&mut envs, "http_proxy", &settings.proxy.http_proxy);
@@ -47,10 +44,8 @@ pub fn export_portable_settings(
 ) -> Result<SettingsTransferResult, String> {
     fs::create_dir_all(backups_dir)
         .map_err(|error| format!("创建设置导出目录失败 {}: {error}", backups_dir.display()))?;
-    let path = backups_dir.join(format!(
-        "gsdesk-settings-{}.json",
-        Utc::now().format("%Y%m%d%H%M%S%9f")
-    ));
+    let path =
+        backups_dir.join(format!("gsdesk-settings-{}.json", Utc::now().format("%Y%m%d%H%M%S%9f")));
     let fields = portable_setting_fields();
     let skipped = sensitive_setting_fields();
     let payload = json!({
@@ -58,12 +53,15 @@ pub fn export_portable_settings(
         "kind": "gsdesk-settings",
         "exportedAt": Utc::now().to_rfc3339(),
         "settings": {
+            "beginnerMode": settings.beginner_mode,
             "sourceMode": settings.source_mode,
             "selectedSource": settings.selected_source,
+            "customCoreDir": settings.custom_core_dir,
             "pypiIndexMode": settings.pypi_index_mode,
             "pypiIndexUrl": settings.pypi_index_url,
             "preferredCorePort": settings.preferred_core_port,
             "closeCoreOnExit": settings.close_core_on_exit,
+            "hideToTrayOnClose": settings.hide_to_tray_on_close,
             "autoCheckUpdate": settings.auto_check_update,
             "language": settings.language,
             "proxy": {
@@ -76,11 +74,7 @@ pub fn export_portable_settings(
         .map_err(|error| format!("序列化设置导出失败: {error}"))?;
     fs::write(&path, json)
         .map_err(|error| format!("写入设置导出失败 {}: {error}", path.display()))?;
-    Ok(SettingsTransferResult {
-        path: path.to_string_lossy().to_string(),
-        fields,
-        skipped,
-    })
+    Ok(SettingsTransferResult { path: path.to_string_lossy().to_string(), fields, skipped })
 }
 
 pub fn import_portable_settings(
@@ -99,12 +93,15 @@ pub fn import_portable_settings(
     if value.get("kind").and_then(Value::as_str) != Some("gsdesk-settings") {
         return Err("设置导入文件类型不正确，需要 kind=gsdesk-settings".to_string());
     }
-    let settings_value = value
-        .get("settings")
-        .ok_or_else(|| "设置导入文件缺少 settings 字段".to_string())?;
+    let settings_value =
+        value.get("settings").ok_or_else(|| "设置导入文件缺少 settings 字段".to_string())?;
     let mut next = current.clone();
     let mut fields = Vec::new();
 
+    if let Some(value) = settings_value.get("beginnerMode").and_then(Value::as_bool) {
+        next.beginner_mode = value;
+        fields.push("beginnerMode".to_string());
+    }
     if let Some(value) = read_string(settings_value, "sourceMode") {
         if matches!(value.as_str(), "auto" | "github" | "cnb") {
             next.source_mode = value;
@@ -114,6 +111,10 @@ pub fn import_portable_settings(
     if let Some(value) = read_string(settings_value, "selectedSource") {
         next.selected_source = value;
         fields.push("selectedSource".to_string());
+    }
+    if let Some(value) = read_string(settings_value, "customCoreDir") {
+        next.custom_core_dir = value;
+        fields.push("customCoreDir".to_string());
     }
     if let Some(value) = read_string(settings_value, "pypiIndexUrl") {
         next.pypi_index_url = value;
@@ -134,17 +135,15 @@ pub fn import_portable_settings(
             fields.push("preferredCorePort".to_string());
         }
     }
-    if let Some(value) = settings_value
-        .get("closeCoreOnExit")
-        .and_then(Value::as_bool)
-    {
+    if let Some(value) = settings_value.get("closeCoreOnExit").and_then(Value::as_bool) {
         next.close_core_on_exit = value;
         fields.push("closeCoreOnExit".to_string());
     }
-    if let Some(value) = settings_value
-        .get("autoCheckUpdate")
-        .and_then(Value::as_bool)
-    {
+    if let Some(value) = settings_value.get("hideToTrayOnClose").and_then(Value::as_bool) {
+        next.hide_to_tray_on_close = value;
+        fields.push("hideToTrayOnClose".to_string());
+    }
+    if let Some(value) = settings_value.get("autoCheckUpdate").and_then(Value::as_bool) {
         next.auto_check_update = value;
         fields.push("autoCheckUpdate".to_string());
     }
@@ -154,9 +153,7 @@ pub fn import_portable_settings(
             fields.push("language".to_string());
         }
     }
-    if let Some(value) = settings_value
-        .get("proxy")
-        .and_then(|proxy| read_string(proxy, "noProxy"))
+    if let Some(value) = settings_value.get("proxy").and_then(|proxy| read_string(proxy, "noProxy"))
     {
         next.proxy.no_proxy = value;
         fields.push("proxy.noProxy".to_string());
@@ -186,9 +183,7 @@ fn latest_settings_export(backups_dir: &Path) -> Result<std::path::PathBuf, Stri
                     .unwrap_or(false)
         })
         .filter_map(|path| {
-            let modified = fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .ok()?;
+            let modified = fs::metadata(&path).and_then(|metadata| metadata.modified()).ok()?;
             Some((path, modified))
         })
         .collect::<Vec<_>>();
@@ -205,12 +200,15 @@ fn read_string(value: &Value, key: &str) -> Option<String> {
 
 fn portable_setting_fields() -> Vec<String> {
     [
+        "beginnerMode",
         "sourceMode",
         "selectedSource",
+        "customCoreDir",
         "pypiIndexMode",
         "pypiIndexUrl",
         "preferredCorePort",
         "closeCoreOnExit",
+        "hideToTrayOnClose",
         "autoCheckUpdate",
         "language",
         "proxy.noProxy",
@@ -238,18 +236,15 @@ pub fn redact_secrets(input: &str) -> String {
     let mut value = input.to_string();
     for key in ["WS_TOKEN", "REGISTER_CODE", "token", "password", "passwd"] {
         let key = regex::escape(key);
-        value = regex::Regex::new(&format!(
-            r#"(?i)(^|[{{,\s])("?{}"?\s*[:=]\s*)("[^"]+"|[^\s,}}]+)"#,
-            key
-        ))
-        .unwrap()
-        .replace_all(&value, "$1$2\"***\"")
-        .to_string();
+        let pattern = format!(r#"(?i)(^|[{{,\s])("?{}"?\s*[:=]\s*)("[^"]+"|[^\s,}}]+)"#, key);
+        if let Ok(regex) = regex::Regex::new(&pattern) {
+            value = regex.replace_all(&value, "$1$2\"***\"").to_string();
+        }
     }
-    regex::Regex::new(r#"(https?://)([^:/\s]+):([^@\s]+)@"#)
-        .unwrap()
-        .replace_all(&value, "$1$2:***@")
-        .to_string()
+    match regex::Regex::new(r#"(https?://)([^:/\s]+):([^@\s]+)@"#) {
+        Ok(regex) => regex.replace_all(&value, "$1$2:***@").to_string(),
+        Err(_) => value,
+    }
 }
 
 #[cfg(test)]
@@ -260,9 +255,7 @@ mod tests {
     fn proxy_env_preserves_no_proxy() {
         let settings = Settings::default();
         let envs = env_from_settings(&settings);
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "NO_PROXY" && value.contains("127.0.0.1")));
+        assert!(envs.iter().any(|(key, value)| key == "NO_PROXY" && value.contains("127.0.0.1")));
     }
 
     #[test]
@@ -290,12 +283,15 @@ mod tests {
         settings.proxy.no_proxy = "127.0.0.1,localhost".to_string();
         settings.pypi_index_mode = "manual".to_string();
         settings.preferred_core_port = Some(8899);
+        settings.custom_core_dir = "D:\\gsuid_core".to_string();
 
         let result = export_portable_settings(&dir, &settings).unwrap();
         let raw = fs::read_to_string(&result.path).unwrap();
 
         assert!(raw.contains("\"pypiIndexMode\": \"manual\""));
+        assert!(raw.contains("\"beginnerMode\": true"));
         assert!(raw.contains("\"preferredCorePort\": 8899"));
+        assert!(raw.contains("\"customCoreDir\": \"D:\\\\gsuid_core\""));
         assert!(raw.contains("127.0.0.1,localhost"));
         assert!(!raw.contains("secret"));
         assert!(result.fields.contains(&"pypiIndexMode".to_string()));
@@ -317,11 +313,14 @@ mod tests {
             r#"{
               "kind": "gsdesk-settings",
               "settings": {
+                "beginnerMode": false,
                 "sourceMode": "cnb",
                 "selectedSource": "https://cnb.cool/gscore-mirror/gsuid_core.git",
+                "customCoreDir": "D:\\gsuid_core",
                 "pypiIndexMode": "manual",
                 "pypiIndexUrl": "https://mirrors.aliyun.com/pypi/simple/",
                 "preferredCorePort": 8899,
+                "hideToTrayOnClose": false,
                 "proxy": { "noProxy": "127.0.0.1,localhost,::1" }
               }
             }"#,
@@ -333,13 +332,16 @@ mod tests {
         let (settings, result) = import_portable_settings(&dir, &current, Some(&path)).unwrap();
 
         assert_eq!(settings.source_mode, "cnb");
+        assert!(!settings.beginner_mode);
+        assert_eq!(settings.custom_core_dir, "D:\\gsuid_core");
         assert_eq!(settings.pypi_index_mode, "manual");
         assert_eq!(settings.preferred_core_port, Some(8899));
-        assert_eq!(
-            settings.proxy.http_proxy,
-            "http://user:secret@127.0.0.1:7890"
-        );
+        assert!(!settings.hide_to_tray_on_close);
+        assert_eq!(settings.proxy.http_proxy, "http://user:secret@127.0.0.1:7890");
         assert!(result.fields.contains(&"pypiIndexMode".to_string()));
+        assert!(result.fields.contains(&"beginnerMode".to_string()));
+        assert!(result.fields.contains(&"customCoreDir".to_string()));
+        assert!(result.fields.contains(&"hideToTrayOnClose".to_string()));
         assert!(result.fields.contains(&"proxy.noProxy".to_string()));
 
         let _ = fs::remove_dir_all(dir);

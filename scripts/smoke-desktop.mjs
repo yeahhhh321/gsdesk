@@ -74,7 +74,12 @@ async function killWindowsTree(pid) {
 
 async function smokeMacos(appPath, timeout, keep) {
   await run("open", ["-n", appPath]);
-  const appName = appPath.endsWith(".app") ? appPath.split(/[\\/]/).at(-1).replace(/\.app$/i, "") : "gsdesk";
+  const appName = appPath.endsWith(".app")
+    ? appPath
+        .split(/[\\/]/)
+        .at(-1)
+        .replace(/\.app$/i, "")
+    : "gsdesk";
   try {
     const state = await waitForMacosProcess(appName, timeout);
     safeWrite(`[desktop-smoke] macos ok process=${JSON.stringify(state)}\n`);

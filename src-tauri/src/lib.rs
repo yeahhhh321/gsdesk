@@ -1,11 +1,16 @@
-mod core_config;
+mod core_logs;
+mod data_cleanup;
 mod diagnostics;
+mod failure_rules;
 mod models;
 mod network;
 mod paths;
+mod ports;
 mod preflight;
 mod process;
+mod runtime_backup;
 mod service;
+mod service_logs;
 mod settings;
 mod toolchain;
 mod tray;
@@ -15,12 +20,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use models::{
-    AppStateResponse, CoreConfigFileContent, CoreConfigFileSummary, CoreConfigReadRequest,
-    CoreConfigSaveRequest, CoreConfigSaveResult, CoreUpdateRequest, CoreUpdateResult, LogEntry,
-    MirrorCheckResult, NetworkDiagnosticResult, RepairRuntimeRequest, RuntimeBackupResult,
-    RuntimeRestoreRequest, RuntimeRestoreResult, ServiceSnapshot, Settings,
-    SettingsTransferRequest, SettingsTransferResult, SourceProbeResult, StartServiceRequest,
-    UpdateInfo, WebConsoleInfo,
+    AppStateResponse, ClearAppDataResult, ClearPortRequest, ClearPortResult, CoreUpdateRequest,
+    CoreUpdateResult, LogEntry, MirrorCheckResult, NetworkDiagnosticResult, ProcessResourceUsage,
+    RepairRuntimeRequest, RuntimeBackupResult, RuntimeRestoreRequest, RuntimeRestoreResult,
+    ServiceSnapshot, Settings, SettingsTransferRequest, SettingsTransferResult, SourceProbeResult,
+    StartServiceRequest, UpdateInfo, UpdateInstallResult, WebConsoleInfo,
 };
 use service::SharedRuntime;
 use tauri::{AppHandle, Manager, State};
@@ -49,7 +53,8 @@ fn configure_proxy(app: AppHandle, settings: Settings) -> Result<AppStateRespons
 #[tauri::command]
 fn probe_sources(app: AppHandle) -> Result<Vec<SourceProbeResult>, String> {
     let settings = load_settings_for_app(&app)?;
-    Ok(network::probe_sources(&settings))
+    let (_, paths) = paths::app_paths(&app)?;
+    Ok(network::probe_sources(&settings, toolchain::git_program(&app, &paths)))
 }
 
 #[tauri::command]
@@ -65,15 +70,16 @@ fn test_network_targets(
 ) -> Result<Vec<NetworkDiagnosticResult>, String> {
     let settings = load_settings_for_app(&app)?;
     let (_, paths) = paths::app_paths(&app)?;
+    service::attach_persisted_core_if_running(&app, &runtime, &paths);
     let webconsole_url = {
-        let mut guard = runtime.inner.lock().unwrap();
-        service::snapshot(&mut guard, &paths, service::core_git_metadata(&paths))
+        let mut guard = runtime.lock();
+        service::snapshot(&mut guard, &paths, service::core_git_metadata(&app, &paths))
             .into_iter()
             .find(|item| item.service_id == service::GSUID_SERVICE_ID)
             .and_then(|item| item.url)
             .map(|url| format!("{}/app", url.trim_end_matches('/')))
     };
-    Ok(network::diagnose_targets(&settings, webconsole_url))
+    Ok(network::diagnose_targets(&settings, webconsole_url, toolchain::git_program(&app, &paths)))
 }
 
 #[tauri::command]
@@ -102,7 +108,7 @@ fn stop_service(
     runtime: State<SharedRuntime>,
     service_id: Option<String>,
 ) -> Result<AppStateResponse, String> {
-    ensure_core_service(service_id)?;
+    service::ensure_gsuid_service(service_id.as_deref())?;
     service::stop_core(&app, &runtime)?;
     app_state(&app, &runtime)
 }
@@ -113,7 +119,7 @@ fn restart_service(
     runtime: State<SharedRuntime>,
     service_id: Option<String>,
 ) -> Result<ServiceSnapshot, String> {
-    ensure_core_service(service_id)?;
+    service::ensure_gsuid_service(service_id.as_deref())?;
     service::stop_core(&app, &runtime)?;
     let settings = load_settings_for_app(&app)?;
     service::start_core(&app, &runtime, &settings, None)
@@ -137,6 +143,47 @@ fn repair_runtime(
     let settings = load_settings_for_app(&app)?;
     service::repair_runtime(&app, &runtime, &settings, request)?;
     app_state(&app, &runtime)
+}
+
+#[tauri::command]
+fn clear_occupied_port(
+    app: AppHandle,
+    runtime: State<SharedRuntime>,
+    request: Option<ClearPortRequest>,
+) -> Result<ClearPortResult, String> {
+    let settings = load_settings_for_app(&app)?;
+    let port =
+        request.and_then(|request| request.port).or(settings.preferred_core_port).unwrap_or(8765);
+    let task_id = service::start_runtime_task(
+        &runtime,
+        "清理端口占用",
+        "detect",
+        &format!("检查并强杀占用端口 {port} 的进程"),
+    );
+    let result = ports::clear_occupied_port(port);
+    match &result {
+        Ok(result) => {
+            service::finish_runtime_task(&runtime, task_id, "success", "done", &result.message);
+            service::push_system_log(&app, &runtime, "info", &result.message);
+        }
+        Err(error) => {
+            service::finish_runtime_task(&runtime, task_id, "failed", "error", error);
+            service::push_system_log(&app, &runtime, "error", error);
+        }
+    }
+    result
+}
+
+#[tauri::command]
+fn clear_app_data(
+    app: AppHandle,
+    runtime: State<SharedRuntime>,
+) -> Result<ClearAppDataResult, String> {
+    let (_, paths) = paths::app_paths(&app)?;
+    service::stop_core(&app, &runtime)?;
+    let result = data_cleanup::clear_app_data(&paths)?;
+    service::reset_runtime_after_data_clear(&runtime);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -184,10 +231,8 @@ fn import_settings(
 ) -> Result<AppStateResponse, String> {
     let (_, paths) = paths::app_paths(&app)?;
     let current = settings::load_settings(&PathBuf::from(&paths.settings_file));
-    let request_path = request
-        .as_ref()
-        .and_then(|request| request.path.as_ref())
-        .map(PathBuf::from);
+    let request_path =
+        request.as_ref().and_then(|request| request.path.as_ref()).map(PathBuf::from);
     let (settings, _) = settings::import_portable_settings(
         &PathBuf::from(&paths.backups_dir),
         &current,
@@ -199,49 +244,6 @@ fn import_settings(
 }
 
 #[tauri::command]
-fn list_core_config_files(app: AppHandle) -> Result<Vec<CoreConfigFileSummary>, String> {
-    let (_, paths) = paths::app_paths(&app)?;
-    core_config::list_core_config_files(&paths)
-}
-
-#[tauri::command]
-fn read_core_config_file(
-    app: AppHandle,
-    request: CoreConfigReadRequest,
-) -> Result<CoreConfigFileContent, String> {
-    let (_, paths) = paths::app_paths(&app)?;
-    core_config::read_core_config_file(&paths, &request.relative_path)
-}
-
-#[tauri::command]
-fn save_core_config_file(
-    app: AppHandle,
-    request: CoreConfigSaveRequest,
-) -> Result<CoreConfigSaveResult, String> {
-    let (_, paths) = paths::app_paths(&app)?;
-    core_config::save_core_config_file(&paths, &request.relative_path, request.entries)
-}
-
-#[tauri::command]
-fn open_core_config_file(app: AppHandle, request: CoreConfigReadRequest) -> Result<(), String> {
-    let (_, paths) = paths::app_paths(&app)?;
-    let target = core_config::resolve_allowed_config_path(&paths, &request.relative_path)?;
-    if cfg!(windows) {
-        Command::new("explorer")
-            .arg(format!("/select,{}", target.display()))
-            .spawn()
-            .map_err(|error| format!("定位配置文件失败: {error}"))?;
-    } else {
-        Command::new("open")
-            .arg("-R")
-            .arg(&target)
-            .spawn()
-            .map_err(|error| format!("定位配置文件失败: {error}"))?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
 fn bootstrap_uv(app: AppHandle, runtime: State<SharedRuntime>) -> Result<AppStateResponse, String> {
     let settings = load_settings_for_app(&app)?;
     let (_, paths) = paths::app_paths(&app)?;
@@ -249,9 +251,9 @@ fn bootstrap_uv(app: AppHandle, runtime: State<SharedRuntime>) -> Result<AppStat
         &runtime,
         "安装 uv",
         "prepare",
-        "准备安装 uv 到 GSDesk 隔离目录",
+        "准备使用内置 Python 创建或更新 uv",
     );
-    service::push_system_log(&app, &runtime, "info", "开始安装 uv 到隔离目录");
+    service::push_system_log(&app, &runtime, "info", "开始使用内置 Python 创建或更新 uv");
     let result = toolchain::bootstrap_uv(&app, &paths, &settings, |stage, message| {
         service::update_runtime_task(&runtime, task_id, stage, message);
         service::push_system_log(&app, &runtime, "info", message);
@@ -269,12 +271,12 @@ fn bootstrap_uv(app: AppHandle, runtime: State<SharedRuntime>) -> Result<AppStat
                 task_id,
                 "success",
                 "done",
-                "uv 已安装并验证可用",
+                "uv 已通过内置 Python 更新并验证可用",
             );
             service::push_system_log(
                 &app,
                 &runtime,
-                "success",
+                "info",
                 &format!(
                     "uv 已可用: {}",
                     info.uv_version.unwrap_or_else(|| "版本未知".to_string())
@@ -283,21 +285,10 @@ fn bootstrap_uv(app: AppHandle, runtime: State<SharedRuntime>) -> Result<AppStat
             app_state(&app, &runtime)
         }
         Err(error) => {
-            let status = if service::is_task_cancelled_error(&error) {
-                "cancelled"
-            } else {
-                "failed"
-            };
-            let stage = if status == "cancelled" {
-                "cancelled"
-            } else {
-                "error"
-            };
-            let level = if status == "cancelled" {
-                "warn"
-            } else {
-                "error"
-            };
+            let status =
+                if service::is_task_cancelled_error(&error) { "cancelled" } else { "failed" };
+            let stage = if status == "cancelled" { "cancelled" } else { "error" };
+            let level = if status == "cancelled" { "warn" } else { "error" };
             service::finish_runtime_task(&runtime, task_id, status, stage, &error);
             service::push_system_log(&app, &runtime, level, &error);
             Err(error)
@@ -310,7 +301,11 @@ fn check_service_health(
     app: AppHandle,
     runtime: State<SharedRuntime>,
 ) -> Result<AppStateResponse, String> {
-    app_state(&app, &runtime)
+    app_state_with_options(
+        &app,
+        &runtime,
+        AppStateOptions { sync_logs: false, include_logs: false },
+    )
 }
 
 #[tauri::command]
@@ -319,10 +314,11 @@ fn open_webconsole(
     runtime: State<SharedRuntime>,
     service_id: Option<String>,
 ) -> Result<WebConsoleInfo, String> {
-    ensure_core_service(service_id)?;
+    service::ensure_gsuid_service(service_id.as_deref())?;
     let (_, paths) = paths::app_paths(&app)?;
-    let mut guard = runtime.inner.lock().unwrap();
-    let snapshot = service::snapshot(&mut guard, &paths, service::core_git_metadata(&paths))
+    service::attach_persisted_core_if_running(&app, &runtime, &paths);
+    let mut guard = runtime.lock();
+    let snapshot = service::snapshot(&mut guard, &paths, service::core_git_metadata(&app, &paths))
         .into_iter()
         .find(|item| item.service_id == service::GSUID_SERVICE_ID)
         .ok_or_else(|| "无法读取 Core 状态".to_string())?;
@@ -334,10 +330,23 @@ fn open_webconsole(
 }
 
 #[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("外部打开失败: URL 为空".to_string());
+    }
+    if !is_local_webconsole_url(trimmed) {
+        return Err(format!("外部打开失败: 只允许打开本机 WebConsole 地址: {trimmed}"));
+    }
+    tauri_plugin_opener::open_url(trimmed, None::<&str>)
+        .map_err(|error| format!("外部打开失败: {error}"))
+}
+
+#[tauri::command]
 fn stream_logs(app: AppHandle, runtime: State<SharedRuntime>) -> Result<Vec<LogEntry>, String> {
     service::sync_core_file_logs(&app, &runtime)?;
-    let guard = runtime.inner.lock().unwrap();
-    Ok(service::recent_logs(&guard))
+    let guard = runtime.lock();
+    Ok(service::recent_core_logs(&guard))
 }
 
 #[tauri::command]
@@ -348,8 +357,13 @@ fn export_diagnostics(app: AppHandle, runtime: State<SharedRuntime>) -> Result<S
 }
 
 #[tauri::command]
-fn check_shell_update() -> Result<UpdateInfo, String> {
-    Ok(update::check_shell_update())
+async fn check_shell_update(app: AppHandle) -> Result<UpdateInfo, String> {
+    Ok(update::check_shell_update(&app).await)
+}
+
+#[tauri::command]
+async fn install_shell_update(app: AppHandle) -> Result<UpdateInstallResult, String> {
+    update::install_shell_update(app).await
 }
 
 #[tauri::command]
@@ -396,24 +410,55 @@ fn load_settings_for_app(app: &AppHandle) -> Result<Settings, String> {
     Ok(settings::load_settings(&PathBuf::from(paths.settings_file)))
 }
 
+fn is_local_webconsole_url(url: &str) -> bool {
+    url.starts_with("http://127.0.0.1:")
+        || url.starts_with("http://localhost:")
+        || url.starts_with("http://[::1]:")
+}
+
 fn app_state(app: &AppHandle, runtime: &SharedRuntime) -> Result<AppStateResponse, String> {
+    app_state_with_options(app, runtime, AppStateOptions { sync_logs: true, include_logs: true })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AppStateOptions {
+    sync_logs: bool,
+    include_logs: bool,
+}
+
+fn app_state_with_options(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    options: AppStateOptions,
+) -> Result<AppStateResponse, String> {
     let (_, paths) = paths::app_paths(app)?;
     let settings = settings::load_settings(&PathBuf::from(&paths.settings_file));
     service::sanitize_persisted_core_log_once(app, runtime);
-    service::sync_core_file_logs(app, runtime)?;
-    let mut guard = runtime.inner.lock().unwrap();
-    let core_git = service::core_git_metadata(&paths);
+    service::attach_persisted_core_if_running(app, runtime, &paths);
+    if options.sync_logs {
+        service::sync_core_file_logs(app, runtime)?;
+    }
+    let mut guard = runtime.lock();
+    let core_git = service::core_git_metadata(app, &paths);
     let services = service::snapshot(&mut guard, &paths, core_git);
-    let recent_logs = service::recent_logs(&guard);
+    let recent_logs =
+        if options.include_logs { service::recent_core_logs(&guard) } else { Vec::new() };
     let task_history = service::task_history(&guard);
     drop(guard);
+    service::ensure_webconsole_probe(app, runtime, &paths);
     let toolchain = toolchain::uv_status(app, &paths);
-    let preflight_checks = preflight::run(&settings, &paths, &toolchain);
+    let preflight_checks = preflight::run(&settings, &paths, &toolchain, &services);
     let uv_detected = toolchain.uv_detected;
+    let shell_pid = std::process::id();
+    let shell = ProcessResourceUsage {
+        pid: shell_pid,
+        memory_bytes: process::process_memory_bytes(shell_pid),
+    };
     Ok(AppStateResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         settings,
         paths,
+        shell,
         services,
         recent_logs,
         preflight_checks,
@@ -423,21 +468,18 @@ fn app_state(app: &AppHandle, runtime: &SharedRuntime) -> Result<AppStateRespons
     })
 }
 
-fn ensure_core_service(service_id: Option<String>) -> Result<(), String> {
-    if let Some(service_id) = service_id {
-        if service_id != service::GSUID_SERVICE_ID {
-            return Err("v1 仅支持 gsuid_core，NoneBot2 仅预留架构".to_string());
-        }
-    }
-    Ok(())
-}
-
 pub fn run() {
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(SharedRuntime::default())
         .manage(tray::TrayState::default())
         .setup(|app| {
+            let handle = app.handle().clone();
+            let runtime = handle.state::<SharedRuntime>();
+            if let Ok((_, paths)) = paths::app_paths(&handle) {
+                service::attach_persisted_core_if_running(&handle, &runtime, &paths);
+            }
             tray::setup_tray(app)?;
             Ok(())
         })
@@ -447,6 +489,11 @@ pub fn run() {
             };
             let app = window.app_handle().clone();
             if !tray::is_quitting(&app) {
+                if !tray::should_hide_to_tray_on_close(&app) {
+                    api.prevent_close();
+                    tray::quit_app(&app);
+                    return;
+                }
                 api.prevent_close();
                 let _ = window.hide();
                 tray::hide_window_to_tray(&app);
@@ -467,23 +514,40 @@ pub fn run() {
             restart_service,
             cancel_current_task,
             repair_runtime,
+            clear_occupied_port,
+            clear_app_data,
             core_update,
             create_runtime_backup,
             restore_runtime_backup,
             export_settings,
             import_settings,
-            list_core_config_files,
-            read_core_config_file,
-            save_core_config_file,
-            open_core_config_file,
             bootstrap_uv,
             check_service_health,
             open_webconsole,
+            open_external_url,
             stream_logs,
             export_diagnostics,
             check_shell_update,
+            install_shell_update,
             open_path
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running GSDesk");
+        .run(tauri::generate_context!());
+
+    if let Err(error) = result {
+        eprintln!("GSDesk 启动失败: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_webconsole_url;
+
+    #[test]
+    fn external_open_allows_only_local_webconsole_hosts() {
+        assert!(is_local_webconsole_url("http://127.0.0.1:8765/app"));
+        assert!(is_local_webconsole_url("http://localhost:8765/app"));
+        assert!(is_local_webconsole_url("http://[::1]:8765/app"));
+        assert!(!is_local_webconsole_url("https://github.com/yeahhhh321/gsdesk"));
+        assert!(!is_local_webconsole_url("http://example.com:8765/app"));
+    }
 }

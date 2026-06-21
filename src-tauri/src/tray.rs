@@ -85,20 +85,17 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
 }
 
 pub fn is_quitting(app: &AppHandle) -> bool {
-    app.try_state::<TrayState>()
-        .map(|state| state.is_quitting())
-        .unwrap_or(false)
+    app.try_state::<TrayState>().map(|state| state.is_quitting()).unwrap_or(false)
+}
+
+pub fn should_hide_to_tray_on_close(app: &AppHandle) -> bool {
+    load_settings(app).map(|settings| settings.hide_to_tray_on_close).unwrap_or(true)
 }
 
 pub fn hide_window_to_tray(app: &AppHandle) {
     update_tray_tooltip(app);
     let runtime = app.state::<SharedRuntime>();
-    service::push_system_log(
-        app,
-        &runtime,
-        "info",
-        "窗口已隐藏到系统托盘，Core 状态保持不变",
-    );
+    service::push_system_log(app, &runtime, "info", "窗口已隐藏到系统托盘，Core 状态保持不变");
 }
 
 pub fn cleanup_core_for_exit(app: &AppHandle) {
@@ -162,6 +159,10 @@ where
 }
 
 fn request_quit(app: &AppHandle) {
+    quit_app(app);
+}
+
+pub fn quit_app(app: &AppHandle) {
     if let Some(state) = app.try_state::<TrayState>() {
         state.begin_quit();
     }
@@ -186,8 +187,9 @@ fn open_webconsole(app: &AppHandle) -> Result<(), String> {
 fn current_webconsole_url(app: &AppHandle) -> Result<String, String> {
     let (_, paths) = paths::app_paths(app)?;
     let runtime = app.state::<SharedRuntime>();
-    let mut guard = runtime.inner.lock().unwrap();
-    service::snapshot(&mut guard, &paths, service::core_git_metadata(&paths))
+    service::attach_persisted_core_if_running(app, &runtime, &paths);
+    let mut guard = runtime.lock();
+    service::snapshot(&mut guard, &paths, service::core_git_metadata(app, &paths))
         .into_iter()
         .find(|service| service.service_id == service::GSUID_SERVICE_ID)
         .and_then(|service| service.url)
@@ -209,10 +211,7 @@ fn open_external(target: &str) -> Result<(), String> {
             .spawn()
             .map_err(|error| format!("打开失败: {error}"))?;
     } else {
-        Command::new("open")
-            .arg(target)
-            .spawn()
-            .map_err(|error| format!("打开失败: {error}"))?;
+        Command::new("open").arg(target).spawn().map_err(|error| format!("打开失败: {error}"))?;
     }
     Ok(())
 }
@@ -232,8 +231,9 @@ fn core_status_text(app: &AppHandle) -> String {
         return "Core 状态未知".to_string();
     };
     let runtime = app.state::<SharedRuntime>();
-    let mut guard = runtime.inner.lock().unwrap();
-    let service = service::snapshot(&mut guard, &paths, service::core_git_metadata(&paths))
+    service::attach_persisted_core_if_running(app, &runtime, &paths);
+    let mut guard = runtime.lock();
+    let service = service::snapshot(&mut guard, &paths, service::core_git_metadata(app, &paths))
         .into_iter()
         .find(|service| service.service_id == service::GSUID_SERVICE_ID);
     let Some(service) = service else {
@@ -255,22 +255,18 @@ fn log_tray_error(app: &AppHandle, error: &str) {
 
 fn load_settings(app: &AppHandle) -> Result<crate::models::Settings, String> {
     let (_, paths) = paths::app_paths(app)?;
-    Ok(settings::load_settings(&std::path::PathBuf::from(
-        paths.settings_file,
-    )))
+    Ok(settings::load_settings(&std::path::PathBuf::from(paths.settings_file)))
 }
 
 fn should_show_from_tray_event(event: &TrayIconEvent) -> bool {
     matches!(
         event,
-        TrayIconEvent::DoubleClick {
-            button: MouseButton::Left,
-            ..
-        } | TrayIconEvent::Click {
-            button: MouseButton::Left,
-            button_state: MouseButtonState::Up,
-            ..
-        }
+        TrayIconEvent::DoubleClick { button: MouseButton::Left, .. }
+            | TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            }
     )
 }
 
@@ -297,7 +293,6 @@ fn service_status_label(status: ServiceStatus) -> &'static str {
         ServiceStatus::Stopping => "停止中",
         ServiceStatus::Stopped => "已停止",
         ServiceStatus::Failed => "失败",
-        ServiceStatus::Crashed => "已崩溃",
     }
 }
 
@@ -310,14 +305,8 @@ mod tests {
         assert_eq!(tray_action(MENU_SHOW), Some(TrayAction::ShowMain));
         assert_eq!(tray_action(MENU_START_CORE), Some(TrayAction::StartCore));
         assert_eq!(tray_action(MENU_STOP_CORE), Some(TrayAction::StopCore));
-        assert_eq!(
-            tray_action(MENU_RESTART_CORE),
-            Some(TrayAction::RestartCore)
-        );
-        assert_eq!(
-            tray_action(MENU_OPEN_WEBCONSOLE),
-            Some(TrayAction::OpenWebConsole)
-        );
+        assert_eq!(tray_action(MENU_RESTART_CORE), Some(TrayAction::RestartCore));
+        assert_eq!(tray_action(MENU_OPEN_WEBCONSOLE), Some(TrayAction::OpenWebConsole));
         assert_eq!(tray_action(MENU_OPEN_LOGS), Some(TrayAction::OpenLogs));
         assert_eq!(tray_action(MENU_QUIT), Some(TrayAction::Quit));
         assert_eq!(tray_action("unknown"), None);
@@ -326,7 +315,7 @@ mod tests {
     #[test]
     fn renders_chinese_status_labels() {
         assert_eq!(service_status_label(ServiceStatus::Running), "运行中");
-        assert_eq!(service_status_label(ServiceStatus::Crashed), "已崩溃");
+        assert_eq!(service_status_label(ServiceStatus::Failed), "失败");
     }
 
     #[test]

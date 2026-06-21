@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -26,8 +25,10 @@ impl Default for ProxySettings {
 #[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
+    pub beginner_mode: bool,
     pub source_mode: String,
     pub selected_source: String,
+    pub custom_core_dir: String,
     pub pypi_index_mode: String,
     pub pypi_index_url: String,
     pub preferred_core_port: Option<u16>,
@@ -35,6 +36,7 @@ pub struct Settings {
     pub last_mirror_check_at: Option<String>,
     pub proxy: ProxySettings,
     pub close_core_on_exit: bool,
+    pub hide_to_tray_on_close: bool,
     pub auto_check_update: bool,
     pub install_guide_completed: bool,
     pub language: String,
@@ -43,8 +45,10 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            beginner_mode: true,
             source_mode: "auto".to_string(),
             selected_source: "https://github.com/Genshin-bots/gsuid_core.git".to_string(),
+            custom_core_dir: String::new(),
             pypi_index_mode: "auto".to_string(),
             pypi_index_url: "https://pypi.org/simple/".to_string(),
             preferred_core_port: None,
@@ -52,6 +56,7 @@ impl Default for Settings {
             last_mirror_check_at: None,
             proxy: ProxySettings::default(),
             close_core_on_exit: true,
+            hide_to_tray_on_close: true,
             auto_check_update: true,
             install_guide_completed: false,
             language: "zh-CN".to_string(),
@@ -86,7 +91,16 @@ pub struct ToolchainInfo {
     pub uv_bootstrap_supported: bool,
     pub uv_bootstrap_target: String,
     pub uv_bootstrap_url: Option<String>,
+    pub bundled_python_available: bool,
+    pub bundled_python_path: Option<String>,
     pub uv_error: Option<String>,
+    pub git_detected: bool,
+    pub git_path: Option<String>,
+    pub git_source: String,
+    pub git_version: Option<String>,
+    pub bundled_git_available: bool,
+    pub bundled_git_path: Option<String>,
+    pub git_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,7 +114,6 @@ pub enum ServiceStatus {
     Stopping,
     Stopped,
     Failed,
-    Crashed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +124,7 @@ pub struct ServiceSnapshot {
     pub status: ServiceStatus,
     pub port: Option<u16>,
     pub pid: Option<u32>,
+    pub memory_bytes: Option<u64>,
     pub url: Option<String>,
     pub started_at: Option<String>,
     pub current_commit: Option<String>,
@@ -118,6 +132,13 @@ pub struct ServiceSnapshot {
     pub recent_error: Option<String>,
     pub health_ok: bool,
     pub webconsole_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessResourceUsage {
+    pub pid: u32,
+    pub memory_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,6 +161,7 @@ pub struct AppStateResponse {
     pub version: String,
     pub settings: Settings,
     pub paths: AppPaths,
+    pub shell: ProcessResourceUsage,
     pub services: Vec<ServiceSnapshot>,
     pub recent_logs: Vec<LogEntry>,
     pub preflight_checks: Vec<PreflightCheck>,
@@ -219,9 +241,54 @@ pub struct RepairRuntimeRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClearPortRequest {
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PortOccupant {
+    pub pid: u32,
+    pub name: String,
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearPortResult {
+    pub port: u16,
+    pub occupants: Vec<PortOccupant>,
+    pub killed_pids: Vec<u32>,
+    pub released: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearAppDataResult {
+    pub app_data: String,
+    pub deleted: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CoreUpdateRequest {
     pub action: String,
     pub channel: Option<String>,
+    pub target_commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CoreCommitEntry {
+    pub commit: String,
+    pub short_commit: String,
+    pub subject: String,
+    pub author: String,
+    pub committed_at: String,
+    pub is_current: bool,
+    pub is_rollback: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,6 +299,7 @@ pub struct CoreUpdateResult {
     pub current_commit: Option<String>,
     pub target_commit: Option<String>,
     pub rollback_commit: Option<String>,
+    pub commits: Vec<CoreCommitEntry>,
     pub changed: bool,
     pub message: String,
 }
@@ -273,70 +341,6 @@ pub struct SettingsTransferResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CoreConfigFileSummary {
-    pub relative_path: String,
-    pub label: String,
-    pub path: String,
-    pub size_bytes: u64,
-    pub modified_at: Option<String>,
-    pub entry_count: usize,
-    pub secret_count: usize,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CoreConfigReadRequest {
-    pub relative_path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CoreConfigEntry {
-    pub key: String,
-    pub title: String,
-    pub description: String,
-    pub value: Value,
-    pub value_type: String,
-    pub options: Vec<Value>,
-    pub secret: bool,
-    pub editable: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CoreConfigFileContent {
-    pub relative_path: String,
-    pub path: String,
-    pub schema: String,
-    pub entries: Vec<CoreConfigEntry>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CoreConfigSaveRequest {
-    pub relative_path: String,
-    pub entries: Vec<CoreConfigSaveEntry>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CoreConfigSaveEntry {
-    pub key: String,
-    pub value: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CoreConfigSaveResult {
-    pub relative_path: String,
-    pub path: String,
-    pub backup_path: Option<String>,
-    pub saved: Vec<String>,
-    pub skipped: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct WebConsoleInfo {
     pub url: String,
 }
@@ -353,4 +357,11 @@ pub struct UpdateInfo {
     pub prerelease_url: Option<String>,
     pub notes: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInstallResult {
+    pub version: Option<String>,
+    pub message: String,
 }

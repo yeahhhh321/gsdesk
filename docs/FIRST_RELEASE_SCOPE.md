@@ -40,7 +40,8 @@ v1 要成为一个完整的 `gsuid_core` 桌面运行管家，而不是只包一
 
 - Core 源码、venv、uv cache、uv Python 安装目录都在 GSDesk 应用数据目录
 - uv 可执行文件优先使用 `runtime/tools/uv/uv(.exe)`，其次是打包资源，最后才回退到 PATH
-- 环境页提供“安装/修复 uv”，自动下载到隔离目录，不修改全局配置
+- 环境页提供“安装/修复 uv”，正式安装包优先复制内置 uv 到隔离目录；开发构建缺少资源时才走下载修复
+- 初始化 Python 时复制壳内置 uv-managed CPython 3.12 到 `runtime/uv/python`，并禁用 uv 自动下载 Python
 - 备份快照输出到 `runtime/backups`，不打包 venv、cache 或 Python 安装目录
 - 子进程通过环境变量注入配置
 - 不修改用户全局工具配置
@@ -56,7 +57,7 @@ v1 要成为一个完整的 `gsuid_core` 桌面运行管家，而不是只包一
 
 ### 日志与诊断
 
-- Core JSONL 文件日志为主，stdout/stderr 作为初始化和崩溃兜底
+- Core JSONL 文件日志为主，stdout/stderr 作为初始化和异常兜底
 - 日志搜索、复制、按等级/来源/模块过滤
 - 当前筛选日志可导出，日志目录可直接打开
 - JSONL 坏行显示为 `parse_error`
@@ -68,14 +69,14 @@ v1 要成为一个完整的 `gsuid_core` 桌面运行管家，而不是只包一
 
 ### 更新
 
-- 壳更新检查 GitHub Releases
-- v1 不静默替换安装包
+- 壳更新走 Tauri updater：检查 GitHub Release `latest.json`，用户确认后下载签名更新包、校验、安装并重启
+- 启动时检查壳更新由设置控制，默认开启；诊断页保留手动检查和安装入口
 - Core 更新支持 `latest/stable/dev` 通道；更新前记录回滚点，源码 dirty 时拒绝更新；失败会尝试回滚旧 commit
 - Core 更新和回滚后会同步依赖，避免源码与 venv 不一致
 
 ### 环境与修复
 
-- 初始化前显示环境预检：系统、Git、uv、默认端口、目录权限、磁盘、Core 源码、venv、源码源、PyPI 镜像
+- 初始化前显示环境预检：系统、内置 Git、uv、默认端口、目录权限、磁盘、Core 源码、venv、源码源、PyPI 镜像
 - 首次安装引导提供“一键安装启动”，成功打开 WebConsole 后持久化 `installGuideCompleted`
 - 任务历史记录初始化、启动、停止、修复动作的阶段、耗时和失败原因；支持取消当前运行任务，并重试失败/已取消的可恢复任务
 - 修复面板支持安装/修复隔离 uv、重跑 `uv sync`、清理 uv cache、重建 venv、备份后重新 clone Core
@@ -83,17 +84,18 @@ v1 要成为一个完整的 `gsuid_core` 桌面运行管家，而不是只包一
 - 环境页支持运行时备份，导出脱敏 `settings.redacted.json`、Core data/config/plugins 和日志快照
 - 环境页支持恢复最近运行时备份，恢复前自动创建安全备份，并且只恢复白名单目录
 - 环境页支持导出/导入非敏感设置，代理账号密码不会默认导出
-- 环境页支持 Core 配置编辑器：读取常用 JSON 配置，按字段编辑，敏感字段遮蔽，保存前校验类型并创建备份
+- 环境页支持“清理所有数据”，先停止 Core，再清空 GSDesk 应用数据目录并回到未初始化状态
 - 隔离目录支持复制路径和打开目录，路径打开命令只允许预定义键
 - Windows Core 子进程强制使用 UTF-8：`PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8:replace`，并显式移除 `PYTHONLEGACYWINDOWSSTDIO`、关闭颜色输出
 - GSDesk 诊断文本日志不持久化普通 stdout/info，旧 `logs/core.log` 中的 emoji/符号会转义为 `\u{...}`，避免 GBK 控制台读取时二次报错
-- 工具链预检显示 Git/uv 版本，uv 过旧时给出升级警告
+- 工具链预检显示内置 Git/uv 版本，uv 过旧时给出升级警告
 
 ### 安全与发布
 
 - Tauri CSP 已收紧，仅允许 Tauri IPC、localhost WebConsole 和必要网络检测目标
 - GitHub Actions 覆盖 Windows/macOS no-bundle 验证
-- tag 发布 workflow 生成 Windows NSIS、macOS app/dmg、平台独立的 SHA256SUMS，并上传 Draft Release
+- tag 发布 workflow 先生成平台对应的内置 Git/uv/Python runtime assets，再生成 Windows NSIS、macOS app/dmg/updater 包、签名、`latest.json` 和平台独立的 SHA256SUMS，并发布 GitHub Release
+- Windows NSIS 卸载时通过 installer hook 清理 GSDesk 应用数据目录
 - 本地已验证 Windows NSIS 安装包构建链路
 - `pnpm smoke:core` 可启动真实 `gsuid_core`、等待 `/app`、验证 JSONL 日志并清理进程
 
@@ -117,3 +119,5 @@ v1 要成为一个完整的 `gsuid_core` 桌面运行管家，而不是只包一
 - 真实 Core JSONL 文件可被增量读取，中文/emoji 日志不因 GBK 编码失败
 - 日志页 1000+ 行仍使用虚拟滚动，不全量渲染 DOM
 - 发布前 tag workflow 产物必须带平台独立的 SHA256 校验和
+- 正式安装包 fresh runtime 初始化时不得下载 Python 运行时
+- Windows 卸载后不得残留 GSDesk runtime/logs/settings；macOS 用户需要先走应用内清理再拖拽删除 App

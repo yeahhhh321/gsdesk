@@ -1,42 +1,62 @@
 use std::collections::VecDeque;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::net::TcpListener;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use wait_timeout::ChildExt;
-use zip::write::FileOptions;
 
+use crate::core_logs::{latest_core_log_file, read_core_jsonl_records, CoreFileLogRecord};
 use crate::models::{
-    AppPaths, CoreUpdateRequest, CoreUpdateResult, LogEntry, RepairRuntimeRequest,
+    AppPaths, CoreCommitEntry, CoreUpdateRequest, CoreUpdateResult, LogEntry, RepairRuntimeRequest,
     RuntimeBackupResult, RuntimeRestoreRequest, RuntimeRestoreResult, ServiceSnapshot,
     ServiceStatus, Settings, StartServiceRequest, TaskRecord,
 };
 use crate::paths::app_paths;
+use crate::ports::{select_port, service_port_available};
 use crate::process::{
-    apply_default_child_env, run_command_timeout, LEGACY_WINDOWS_STDIO_ENV, PYTHON_IO_ENCODING,
+    apply_default_child_env, process_memory_bytes, run_command_timeout, LEGACY_WINDOWS_STDIO_ENV,
+    PYTHON_IO_ENCODING,
 };
-use crate::settings::{env_from_settings, redact_secrets};
+use crate::runtime_backup::{create_runtime_backup_inner, restore_runtime_backup_inner};
+use crate::service_logs::{
+    classify_level, contains_terminal_sensitive_char, is_standalone_python_gbk_encoding_error,
+    is_structured_log_prefix_at, log_file_safe_text, normalize_log_records,
+    should_promote_recent_error, ConsoleLogFilter,
+};
+use crate::settings::env_from_settings;
 use crate::toolchain;
+
+pub use crate::service_logs::sanitize_persisted_log_content;
 
 pub const GSUID_SERVICE_ID: &str = "gsuid_core";
 pub const NONEBOT_SERVICE_ID: &str = "nonebot2";
+const NONEBOT_PENDING_MESSAGE: &str =
+    "NoneBot2 暂未配置：后续接入项目目录、进程启动、连接检查和合并日志。";
+const UNSUPPORTED_SERVICE_MESSAGE: &str = "当前只支持管理 gsuid_core；NoneBot2 暂未配置启动方式。";
 const MAX_LOG_ENTRIES: usize = 5000;
 const MAX_PERSISTED_LOG_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ROTATED_LOG_FILES: usize = 5;
 const MAX_INITIAL_CORE_FILE_LOG_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_CORE_LOG_READ_BYTES: usize = 256 * 1024;
+const MAX_CORE_LOG_RECORDS_PER_SYNC: usize = 800;
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(8);
+const CLEANABLE_CORE_UPDATE_PATHS: &[&str] = &["uv.lock"];
 
 #[derive(Clone, Default)]
 pub struct SharedRuntime {
     pub inner: Arc<Mutex<ServiceRuntime>>,
+}
+
+impl SharedRuntime {
+    pub fn lock(&self) -> MutexGuard<'_, ServiceRuntime> {
+        lock_service_runtime(&self.inner)
+    }
 }
 
 pub struct ServiceRuntime {
@@ -49,11 +69,44 @@ pub struct ServiceRuntime {
     pub next_log_id: u64,
     pub core_log_path: Option<PathBuf>,
     pub core_log_offset: u64,
+    pub core_file_log_ready: bool,
     pub core_log_poller_active: bool,
+    pub webconsole_available: bool,
+    pub webconsole_probe_active: bool,
+    pub next_webconsole_probe_at: Option<Instant>,
     pub tasks: VecDeque<TaskRecord>,
     pub next_task_id: u64,
     pub persisted_log_sanitized: bool,
     pub cancel_requested: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoreRepoChange {
+    status: String,
+    path: String,
+}
+
+struct CoreUpdateStep<'a> {
+    action: &'a str,
+    channel: &'a str,
+    target_commit: Option<&'a str>,
+    task_id: u64,
+}
+
+fn lock_service_runtime(runtime: &Arc<Mutex<ServiceRuntime>>) -> MutexGuard<'_, ServiceRuntime> {
+    match runtime.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_command_records(
+    records: &Arc<Mutex<VecDeque<String>>>,
+) -> MutexGuard<'_, VecDeque<String>> {
+    match records.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 impl Default for ServiceRuntime {
@@ -68,13 +121,26 @@ impl Default for ServiceRuntime {
             next_log_id: 1,
             core_log_path: None,
             core_log_offset: 0,
+            core_file_log_ready: false,
             core_log_poller_active: false,
+            webconsole_available: false,
+            webconsole_probe_active: false,
+            next_webconsole_probe_at: None,
             tasks: VecDeque::new(),
             next_task_id: 1,
             persisted_log_sanitized: false,
             cancel_requested: false,
         }
     }
+}
+
+pub fn ensure_gsuid_service(service_id: Option<&str>) -> Result<(), String> {
+    if let Some(service_id) = service_id {
+        if service_id != GSUID_SERVICE_ID {
+            return Err(UNSUPPORTED_SERVICE_MESSAGE.to_string());
+        }
+    }
+    Ok(())
 }
 
 pub fn snapshot(
@@ -84,28 +150,16 @@ pub fn snapshot(
 ) -> Vec<ServiceSnapshot> {
     refresh_child_exit_status(runtime, paths);
     let persisted = if runtime.child.is_none() {
-        load_persisted_core_process(paths).and_then(|record| {
-            if process_alive(record.pid) {
-                Some(record)
-            } else {
-                let _ = clear_persisted_core_process(paths);
-                None
-            }
-        })
+        let persisted = running_persisted_core_process(paths);
+        if let Some(record) = &persisted {
+            attach_runtime_to_persisted_core(runtime, record);
+        } else {
+            clear_detached_core_runtime(runtime);
+        }
+        persisted
     } else {
         None
     };
-    if let Some(record) = &persisted {
-        runtime.port = Some(record.port);
-        runtime.started_at = Some(record.started_at.clone());
-        if matches!(
-            runtime.status,
-            ServiceStatus::Uninitialized | ServiceStatus::Stopped | ServiceStatus::Crashed
-        ) {
-            runtime.status = ServiceStatus::Running;
-            runtime.recent_error = None;
-        }
-    }
     let core_installed = core_runtime_installed(paths);
     let core_status = if runtime.status == ServiceStatus::Uninitialized && core_installed {
         ServiceStatus::Stopped
@@ -118,6 +172,7 @@ pub fn snapshot(
         .as_ref()
         .map(|child| child.id())
         .or_else(|| persisted.as_ref().map(|record| record.pid));
+    let core_memory_bytes = core_pid.and_then(process_memory_bytes);
     vec![
         ServiceSnapshot {
             service_id: GSUID_SERVICE_ID.to_string(),
@@ -125,18 +180,15 @@ pub fn snapshot(
             status: core_status,
             port: runtime.port,
             pid: core_pid,
+            memory_bytes: core_memory_bytes,
             url: core_url.clone(),
             started_at: runtime.started_at.clone(),
-            current_commit: core_git
-                .as_ref()
-                .and_then(|metadata| metadata.commit.clone()),
+            current_commit: core_git.as_ref().and_then(|metadata| metadata.commit.clone()),
             current_tag: core_git.as_ref().and_then(|metadata| metadata.tag.clone()),
             recent_error: runtime.recent_error.clone(),
             health_ok: core_status == ServiceStatus::Running,
-            webconsole_available: core_url
-                .as_ref()
-                .map(|url| webconsole_available(url))
-                .unwrap_or(false),
+            webconsole_available: core_status == ServiceStatus::Running
+                && runtime.webconsole_available,
         },
         ServiceSnapshot {
             service_id: NONEBOT_SERVICE_ID.to_string(),
@@ -144,11 +196,12 @@ pub fn snapshot(
             status: ServiceStatus::Uninitialized,
             port: None,
             pid: None,
+            memory_bytes: None,
             url: None,
             started_at: None,
             current_commit: None,
             current_tag: None,
-            recent_error: Some("v1 仅预留架构，后续支持项目目录、进程启动和连接检查".to_string()),
+            recent_error: Some(NONEBOT_PENDING_MESSAGE.to_string()),
             health_ok: false,
             webconsole_available: false,
         },
@@ -160,10 +213,12 @@ fn refresh_child_exit_status(runtime: &mut ServiceRuntime, paths: &AppPaths) {
         if let Ok(Some(status)) = child.try_wait() {
             if runtime.status == ServiceStatus::Running || runtime.status == ServiceStatus::Starting
             {
-                runtime.status = ServiceStatus::Crashed;
+                runtime.status = ServiceStatus::Failed;
                 runtime.recent_error = Some(format!("Core 进程已退出，退出码: {status}"));
             }
             runtime.child = None;
+            runtime.core_file_log_ready = false;
+            runtime.webconsole_available = false;
             let _ = clear_persisted_core_process(paths);
         }
     }
@@ -175,13 +230,14 @@ pub struct CoreGitMetadata {
     pub tag: Option<String>,
 }
 
-pub fn core_git_metadata(paths: &AppPaths) -> Option<CoreGitMetadata> {
+pub fn core_git_metadata(app: &AppHandle, paths: &AppPaths) -> Option<CoreGitMetadata> {
     let core_dir = PathBuf::from(&paths.core_dir);
     if !core_dir.join(".git").exists() {
         return None;
     }
+    let git_program = toolchain::git_program(app, paths).ok()?;
     let commit = run_command_timeout(
-        "git",
+        &git_program,
         &["rev-parse", "--short", "HEAD"],
         Some(&core_dir),
         &[],
@@ -191,7 +247,7 @@ pub fn core_git_metadata(paths: &AppPaths) -> Option<CoreGitMetadata> {
     .and_then(|output| output.success.then(|| output.stdout.trim().to_string()))
     .filter(|value| !value.is_empty());
     let tag = run_command_timeout(
-        "git",
+        &git_program,
         &["describe", "--tags", "--exact-match", "HEAD"],
         Some(&core_dir),
         &[],
@@ -203,9 +259,33 @@ pub fn core_git_metadata(paths: &AppPaths) -> Option<CoreGitMetadata> {
     Some(CoreGitMetadata { commit, tag })
 }
 
-pub fn core_runtime_installed(paths: &AppPaths) -> bool {
+fn core_runtime_installed(paths: &AppPaths) -> bool {
     let core_dir = PathBuf::from(&paths.core_dir);
     core_dir.join(".git").exists() || core_dir.join("pyproject.toml").exists()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CoreSourceState {
+    GitRepo,
+    SourceTree,
+    Missing,
+    Invalid(String),
+}
+
+fn core_source_state(core_dir: &Path) -> CoreSourceState {
+    if core_dir.join(".git").exists() {
+        return CoreSourceState::GitRepo;
+    }
+    if core_dir.join("pyproject.toml").exists() {
+        return CoreSourceState::SourceTree;
+    }
+    if !core_dir.exists() {
+        return CoreSourceState::Missing;
+    }
+    CoreSourceState::Invalid(format!(
+        "Core 路径已存在，但没有 .git 或 pyproject.toml: {}",
+        core_dir.display()
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,11 +310,7 @@ fn persist_core_process(
         fs::create_dir_all(parent)
             .map_err(|error| format!("创建进程状态目录失败 {}: {error}", parent.display()))?;
     }
-    let record = PersistedCoreProcess {
-        pid,
-        port,
-        started_at: started_at.to_string(),
-    };
+    let record = PersistedCoreProcess { pid, port, started_at: started_at.to_string() };
     let json = serde_json::to_string_pretty(&record)
         .map_err(|error| format!("序列化 Core 进程状态失败: {error}"))?;
     fs::write(&path, json)
@@ -254,6 +330,101 @@ fn clear_persisted_core_process(paths: &AppPaths) -> Result<(), String> {
             .map_err(|error| format!("删除 Core 进程状态失败 {}: {error}", path.display()))?;
     }
     Ok(())
+}
+
+fn running_persisted_core_process(paths: &AppPaths) -> Option<PersistedCoreProcess> {
+    let record = load_persisted_core_process(paths)?;
+    if process_alive(record.pid) {
+        Some(record)
+    } else {
+        let _ = clear_persisted_core_process(paths);
+        None
+    }
+}
+
+fn attach_runtime_to_persisted_core(
+    runtime: &mut ServiceRuntime,
+    record: &PersistedCoreProcess,
+) -> bool {
+    if runtime.child.is_some()
+        || matches!(
+            runtime.status,
+            ServiceStatus::Checking | ServiceStatus::Initializing | ServiceStatus::Stopping
+        )
+    {
+        return false;
+    }
+
+    let was_same_core = matches!(runtime.status, ServiceStatus::Starting | ServiceStatus::Running)
+        && runtime.port == Some(record.port)
+        && runtime.started_at.as_deref() == Some(record.started_at.as_str());
+
+    runtime.port = Some(record.port);
+    runtime.started_at = Some(record.started_at.clone());
+    runtime.status = ServiceStatus::Running;
+    runtime.recent_error = None;
+
+    if !was_same_core {
+        runtime.webconsole_available = false;
+        runtime.next_webconsole_probe_at = None;
+    }
+
+    !was_same_core
+}
+
+fn clear_detached_core_runtime(runtime: &mut ServiceRuntime) {
+    if runtime.child.is_some()
+        || !matches!(runtime.status, ServiceStatus::Starting | ServiceStatus::Running)
+    {
+        return;
+    }
+    runtime.port = None;
+    runtime.started_at = None;
+    runtime.core_file_log_ready = false;
+    runtime.webconsole_available = false;
+    runtime.next_webconsole_probe_at = None;
+    runtime.status = ServiceStatus::Stopped;
+    runtime.recent_error = None;
+}
+
+pub fn attach_persisted_core_if_running(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    paths: &AppPaths,
+) -> bool {
+    let should_activate_background_hooks = {
+        let mut guard = runtime.lock();
+        refresh_child_exit_status(&mut guard, paths);
+        if guard.child.is_some() {
+            return false;
+        }
+
+        let Some(record) = running_persisted_core_process(paths) else {
+            clear_detached_core_runtime(&mut guard);
+            return false;
+        };
+
+        let should_log = attach_runtime_to_persisted_core(&mut guard, &record);
+        if should_log {
+            push_log(
+                &mut guard,
+                app,
+                "system",
+                "info",
+                &format!(
+                    "已加载后台 Core: pid={} http://127.0.0.1:{}/app",
+                    record.pid, record.port
+                ),
+            );
+        }
+        matches!(guard.status, ServiceStatus::Starting | ServiceStatus::Running)
+    };
+
+    if should_activate_background_hooks {
+        spawn_core_file_log_poller(app.clone(), runtime.clone(), paths.clone());
+        ensure_webconsole_probe(app, runtime, paths);
+    }
+    should_activate_background_hooks
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -394,13 +565,9 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     }
 }
 
-pub fn recent_logs(runtime: &ServiceRuntime) -> Vec<LogEntry> {
-    runtime.logs.iter().cloned().collect()
-}
-
 pub fn sanitize_persisted_core_log_once(app: &AppHandle, runtime: &SharedRuntime) {
     let should_sanitize = {
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         if guard.persisted_log_sanitized {
             false
         } else {
@@ -425,6 +592,7 @@ pub fn task_history(runtime: &ServiceRuntime) -> Vec<TaskRecord> {
 
 pub fn sync_core_file_logs(app: &AppHandle, runtime: &SharedRuntime) -> Result<(), String> {
     let (_, paths) = app_paths(app)?;
+    attach_persisted_core_if_running(app, runtime, &paths);
     sync_core_file_logs_from_paths(app, runtime, &paths)
 }
 
@@ -440,12 +608,9 @@ fn sync_core_file_logs_from_paths(
         .map_err(|error| format!("读取 Core 日志文件信息失败 {}: {error}", log_path.display()))?
         .len();
     let (offset, path_changed) = {
-        let guard = runtime.inner.lock().unwrap();
-        let path_changed = guard
-            .core_log_path
-            .as_ref()
-            .map(|path| path != &log_path)
-            .unwrap_or(true);
+        let guard = runtime.lock();
+        let path_changed =
+            guard.core_log_path.as_ref().map(|path| path != &log_path).unwrap_or(true);
         let offset = if path_changed || guard.core_log_offset > file_len {
             file_len.saturating_sub(MAX_INITIAL_CORE_FILE_LOG_BYTES)
         } else {
@@ -454,21 +619,48 @@ fn sync_core_file_logs_from_paths(
         (offset, path_changed)
     };
 
-    let (records, next_offset) = read_core_jsonl_records(&log_path, offset)?;
-    let mut guard = runtime.inner.lock().unwrap();
-    if path_changed {
-        guard.core_log_path = Some(log_path);
+    let (mut records, next_offset) =
+        read_core_jsonl_records(&log_path, offset, MAX_CORE_LOG_READ_BYTES)?;
+    if records.len() > MAX_CORE_LOG_RECORDS_PER_SYNC {
+        let skipped = records.len() - MAX_CORE_LOG_RECORDS_PER_SYNC;
+        records.drain(0..skipped);
     }
-    guard.core_log_offset = next_offset;
-    for record in records {
-        push_core_file_log(&mut guard, app, record);
-    }
+    let has_file_records = !records.is_empty();
+    let entries = {
+        let mut guard = runtime.lock();
+        if path_changed {
+            guard.core_log_path = Some(log_path);
+            guard.core_file_log_ready = false;
+        }
+        let should_remove_console_duplicates = has_file_records && !guard.core_file_log_ready;
+        guard.core_log_offset = next_offset;
+        if has_file_records {
+            guard.core_file_log_ready = true;
+        }
+        let mut entries = Vec::new();
+        for record in records {
+            entries.push(push_core_file_log(&mut guard, record, should_remove_console_duplicates));
+        }
+        entries
+    };
+    emit_log_batch(app, &entries);
     Ok(())
+}
+
+pub fn recent_core_logs(runtime: &ServiceRuntime) -> Vec<LogEntry> {
+    runtime.logs.iter().filter(|entry| entry.stream == "core").cloned().collect()
+}
+
+fn emit_log_batch(app: &AppHandle, entries: &[LogEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    let _ = app.emit("gsdesk-log-batch", entries);
 }
 
 fn spawn_core_file_log_poller(app: AppHandle, runtime: SharedRuntime, paths: AppPaths) {
     let should_spawn = {
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         if guard.core_log_poller_active {
             false
         } else {
@@ -498,13 +690,10 @@ fn spawn_core_file_log_poller(app: AppHandle, runtime: SharedRuntime, paths: App
             }
 
             let keep_running = {
-                let mut guard = runtime.inner.lock().unwrap();
+                let mut guard = runtime.lock();
                 refresh_child_exit_status(&mut guard, &paths);
                 guard.child.is_some()
-                    || matches!(
-                        guard.status,
-                        ServiceStatus::Starting | ServiceStatus::Running
-                    )
+                    || matches!(guard.status, ServiceStatus::Starting | ServiceStatus::Running)
             };
             if !keep_running {
                 break;
@@ -513,7 +702,7 @@ fn spawn_core_file_log_poller(app: AppHandle, runtime: SharedRuntime, paths: App
         }
 
         let _ = sync_core_file_logs_from_paths(&app, &runtime, &paths);
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         guard.core_log_poller_active = false;
     });
 }
@@ -539,7 +728,7 @@ fn start_task(runtime: &mut ServiceRuntime, name: &str, stage: &str, message: &s
 }
 
 pub fn start_runtime_task(runtime: &SharedRuntime, name: &str, stage: &str, message: &str) -> u64 {
-    let mut guard = runtime.inner.lock().unwrap();
+    let mut guard = runtime.lock();
     start_task(&mut guard, name, stage, message)
 }
 
@@ -551,7 +740,7 @@ fn update_task(runtime: &mut ServiceRuntime, id: u64, stage: &str, message: &str
 }
 
 pub fn update_runtime_task(runtime: &SharedRuntime, id: u64, stage: &str, message: &str) {
-    let mut guard = runtime.inner.lock().unwrap();
+    let mut guard = runtime.lock();
     update_task(&mut guard, id, stage, message);
 }
 
@@ -561,15 +750,32 @@ fn finish_task(runtime: &mut ServiceRuntime, id: u64, status: &str, stage: &str,
         task.stage = stage.to_string();
         task.message = message.to_string();
         let ended_at = Utc::now();
-        task.elapsed_ms = chrono::DateTime::parse_from_rfc3339(&task.started_at)
-            .ok()
-            .map(|started| {
+        task.elapsed_ms =
+            chrono::DateTime::parse_from_rfc3339(&task.started_at).ok().map(|started| {
                 ended_at
                     .signed_duration_since(started.with_timezone(&Utc))
                     .num_milliseconds()
                     .max(0) as u128
             });
         task.ended_at = Some(ended_at.to_rfc3339());
+    }
+}
+
+fn finish_task_if_running(
+    runtime: &mut ServiceRuntime,
+    id: u64,
+    status: &str,
+    stage: &str,
+    message: &str,
+) {
+    let should_finish = runtime
+        .tasks
+        .iter()
+        .find(|task| task.id == id)
+        .map(|task| task.status == "running")
+        .unwrap_or(false);
+    if should_finish {
+        finish_task(runtime, id, status, stage, message);
     }
 }
 
@@ -580,23 +786,24 @@ pub fn finish_runtime_task(
     stage: &str,
     message: &str,
 ) {
-    let mut guard = runtime.inner.lock().unwrap();
+    let mut guard = runtime.lock();
     finish_task(&mut guard, id, status, stage, message);
 }
 
 pub fn push_system_log(app: &AppHandle, runtime: &SharedRuntime, level: &str, line: &str) {
-    let mut guard = runtime.inner.lock().unwrap();
+    let mut guard = runtime.lock();
     push_log(&mut guard, app, "system", level, line);
+}
+
+pub fn reset_runtime_after_data_clear(runtime: &SharedRuntime) {
+    let mut guard = runtime.lock();
+    *guard = ServiceRuntime::default();
 }
 
 pub fn cancel_current_task(app: &AppHandle, runtime: &SharedRuntime) -> Result<(), String> {
     let pid_to_kill = {
-        let mut guard = runtime.inner.lock().unwrap();
-        let Some(index) = guard
-            .tasks
-            .iter()
-            .rposition(|task| task.status == "running")
-        else {
+        let mut guard = runtime.lock();
+        let Some(index) = guard.tasks.iter().rposition(|task| task.status == "running") else {
             return Err("当前没有运行中的任务".to_string());
         };
         let task_name = guard.tasks[index].name.clone();
@@ -608,13 +815,7 @@ pub fn cancel_current_task(app: &AppHandle, runtime: &SharedRuntime) -> Result<(
         } else {
             None
         };
-        push_log(
-            &mut guard,
-            app,
-            "system",
-            "warn",
-            &format!("已请求取消任务: {task_name}"),
-        );
+        push_log(&mut guard, app, "system", "warn", &format!("已请求取消任务: {task_name}"));
         pid_to_kill
     };
 
@@ -625,7 +826,7 @@ pub fn cancel_current_task(app: &AppHandle, runtime: &SharedRuntime) -> Result<(
 }
 
 pub fn take_cancel_requested(runtime: &SharedRuntime) -> bool {
-    let mut guard = runtime.inner.lock().unwrap();
+    let mut guard = runtime.lock();
     let requested = guard.cancel_requested;
     guard.cancel_requested = false;
     requested
@@ -637,21 +838,11 @@ pub fn init_core_runtime(
     settings: &Settings,
 ) -> Result<(), String> {
     {
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         guard.status = ServiceStatus::Initializing;
-        let task_id = start_task(
-            &mut guard,
-            "初始化运行时",
-            "prepare",
-            "开始初始化 gsuid_core 运行时",
-        );
-        push_log(
-            &mut guard,
-            app,
-            "system",
-            "info",
-            "开始初始化 gsuid_core 运行时",
-        );
+        let task_id =
+            start_task(&mut guard, "初始化运行时", "prepare", "开始初始化 gsuid_core 运行时");
+        push_log(&mut guard, app, "system", "info", "开始初始化 gsuid_core 运行时");
         drop(guard);
         init_core_runtime_steps(app, runtime, settings, task_id)
     }
@@ -665,112 +856,122 @@ fn init_core_runtime_steps(
 ) -> Result<(), String> {
     let (_, paths) = app_paths(app)?;
     let core_dir = PathBuf::from(&paths.core_dir);
-    let core_parent = core_dir
-        .parent()
-        .ok_or_else(|| "Core 路径缺少父目录".to_string())?
-        .to_path_buf();
+    let core_parent =
+        core_dir.parent().ok_or_else(|| "Core 路径缺少父目录".to_string())?.to_path_buf();
     fs::create_dir_all(&core_parent).map_err(|error| format!("创建 Core 父目录失败: {error}"))?;
 
     let envs = runtime_env(settings, &paths);
     let source = selected_source(settings);
+    let source_state = core_source_state(&core_dir);
+    let git_program =
+        if matches!(&source_state, CoreSourceState::GitRepo | CoreSourceState::Missing) {
+            match toolchain::git_program(app, &paths) {
+                Ok(program) => Some(program),
+                Err(error) => {
+                    mark_task_failed(runtime, task_id, "toolchain", &error);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
     {
-        let mut guard = runtime.inner.lock().unwrap();
-        update_task(
-            &mut guard,
-            task_id,
-            "source",
-            if core_dir.join(".git").exists() {
-                "更新现有 gsuid_core 源码"
-            } else {
-                "拉取 gsuid_core 源码"
-            },
-        );
+        let mut guard = runtime.lock();
+        update_task(&mut guard, task_id, "source", source_state_message(&source_state));
     }
-    if core_dir.join(".git").exists() {
-        if let Some(dirty) = core_repo_dirty(&core_dir, &envs)? {
-            let message = format!("Core 源码存在未提交修改，已停止自动更新: {dirty}");
+    match source_state {
+        CoreSourceState::GitRepo => {
+            let Some(git_program) = git_program.as_deref() else {
+                return Err("Git 工具未完成解析，无法更新 Core 源码".to_string());
+            };
+            if let Some(dirty) = core_repo_dirty(git_program, &core_dir, &envs)? {
+                let message = format!("Core 源码存在未提交修改，已停止自动更新: {dirty}");
+                mark_task_failed(runtime, task_id, "source", &message);
+                return Err(message);
+            }
+            run_logged(
+                app,
+                runtime,
+                git_program,
+                &["fetch", "--all", "--prune"],
+                Some(core_dir.as_path()),
+                &envs,
+                Duration::from_secs(120),
+            )
+            .inspect_err(|error| {
+                mark_task_failed(runtime, task_id, "source", error);
+            })?;
+            run_logged(
+                app,
+                runtime,
+                git_program,
+                &["pull", "--ff-only"],
+                Some(core_dir.as_path()),
+                &envs,
+                Duration::from_secs(120),
+            )
+            .inspect_err(|error| {
+                mark_task_failed(runtime, task_id, "source", error);
+            })?;
+        }
+        CoreSourceState::SourceTree => {
+            let mut guard = runtime.lock();
+            push_log(
+                &mut guard,
+                app,
+                "system",
+                "info",
+                &format!("使用现有 Core 源码目录: {}", core_dir.display()),
+            );
+        }
+        CoreSourceState::Missing => {
+            let Some(git_program) = git_program.as_deref() else {
+                return Err("Git 工具未完成解析，无法拉取 Core 源码".to_string());
+            };
+            clone_core_repo(app, runtime, git_program, source, &core_dir, &envs).inspect_err(
+                |error| {
+                    mark_task_failed(runtime, task_id, "source", error);
+                },
+            )?;
+        }
+        CoreSourceState::Invalid(message) => {
             mark_task_failed(runtime, task_id, "source", &message);
             return Err(message);
         }
-        run_logged(
-            app,
-            runtime,
-            "git",
-            &["fetch", "--all", "--prune"],
-            Some(core_dir.as_path()),
-            &envs,
-            Duration::from_secs(120),
-        )
-        .map_err(|error| {
-            mark_task_failed(runtime, task_id, "source", &error);
-            error
-        })?;
-        run_logged(
-            app,
-            runtime,
-            "git",
-            &["pull", "--ff-only"],
-            Some(core_dir.as_path()),
-            &envs,
-            Duration::from_secs(120),
-        )
-        .map_err(|error| {
-            mark_task_failed(runtime, task_id, "source", &error);
-            error
-        })?;
-    } else {
-        run_logged(
-            app,
-            runtime,
-            "git",
-            &["clone", source, "gsuid_core"],
-            Some(core_parent.as_path()),
-            &envs,
-            Duration::from_secs(300),
-        )
-        .map_err(|error| {
-            mark_task_failed(runtime, task_id, "source", &error);
-            error
-        })?;
     }
 
     let uv_program = match toolchain::uv_program(app, &paths) {
         Ok(program) => program,
         Err(error) => {
-            let mut guard = runtime.inner.lock().unwrap();
+            let mut guard = runtime.lock();
             guard.status = ServiceStatus::Failed;
             guard.recent_error = Some(error.clone());
-            push_log(
-                &mut guard,
-                app,
-                "system",
-                "error",
-                "未检测到 uv，无法初始化 Python 环境",
-            );
+            push_log(&mut guard, app, "system", "error", "未检测到 uv，无法初始化 Python 环境");
             finish_task(&mut guard, task_id, "failed", "toolchain", &error);
             return Err(error);
         }
     };
 
+    let python_result =
+        toolchain::ensure_python_runtime(app, &paths, &uv_program, &envs, |stage, message| {
+            let mut guard = runtime.lock();
+            update_task(&mut guard, task_id, stage, message);
+        })
+        .inspect_err(|error| {
+            mark_task_failed(runtime, task_id, "python", error);
+        })?;
     {
-        let mut guard = runtime.inner.lock().unwrap();
-        update_task(&mut guard, task_id, "python", "安装 uv 托管 Python 3.12");
+        let mut guard = runtime.lock();
+        push_log(
+            &mut guard,
+            app,
+            "system",
+            "info",
+            &format!("Python 3.12 已就绪: {} / {}", python_result.source, python_result.python),
+        );
     }
-    run_logged(
-        app,
-        runtime,
-        &uv_program,
-        &["python", "install", "3.12"],
-        Some(&core_dir),
-        &envs,
-        Duration::from_secs(600),
-    )
-    .map_err(|error| {
-        mark_task_failed(runtime, task_id, "python", &error);
-        error
-    })?;
     {
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         update_task(&mut guard, task_id, "dependencies", "同步 Python 依赖");
     }
     run_logged(
@@ -782,37 +983,80 @@ fn init_core_runtime_steps(
         &envs,
         Duration::from_secs(1200),
     )
-    .map_err(|error| {
-        mark_task_failed(runtime, task_id, "dependencies", &error);
-        error
+    .inspect_err(|error| {
+        mark_task_failed(runtime, task_id, "dependencies", error);
     })?;
 
-    let mut guard = runtime.inner.lock().unwrap();
+    let mut guard = runtime.lock();
     guard.status = ServiceStatus::Stopped;
     guard.recent_error = None;
-    push_log(&mut guard, app, "system", "success", "运行时初始化完成");
+    push_log(&mut guard, app, "system", "info", "运行时初始化完成");
     finish_task(&mut guard, task_id, "success", "done", "运行时初始化完成");
     Ok(())
 }
 
-fn core_repo_dirty(core_dir: &Path, envs: &[(String, String)]) -> Result<Option<String>, String> {
+fn core_repo_dirty(
+    git_program: &str,
+    core_dir: &Path,
+    envs: &[(String, String)],
+) -> Result<Option<String>, String> {
+    let changes = core_repo_changes(git_program, core_dir, envs, false)?;
+    if changes.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(core_changes_summary(&changes, 5)))
+    }
+}
+
+fn core_repo_changes(
+    git_program: &str,
+    core_dir: &Path,
+    envs: &[(String, String)],
+    include_untracked: bool,
+) -> Result<Vec<CoreRepoChange>, String> {
+    let untracked_arg =
+        if include_untracked { "--untracked-files=all" } else { "--untracked-files=no" };
     let output = run_command_timeout(
-        "git",
-        &["status", "--porcelain", "--untracked-files=no"],
+        git_program,
+        &["status", "--porcelain", untracked_arg],
         Some(core_dir),
         envs,
         Duration::from_secs(20),
     )?;
-    let status = output.stdout.trim();
-    if status.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(status.lines().take(5).collect::<Vec<_>>().join("; ")))
+    if !output.success {
+        return Err(format!(
+            "读取 Core git 状态失败: {}",
+            first_non_empty(&output.stderr, &output.stdout)
+        ));
     }
+    Ok(output.stdout.lines().filter_map(parse_core_repo_change).collect())
+}
+
+fn parse_core_repo_change(line: &str) -> Option<CoreRepoChange> {
+    let status = line.get(0..2)?.trim();
+    let path = line.get(3..)?.trim();
+    if status.is_empty() || path.is_empty() {
+        return None;
+    }
+    let normalized_path = match path.rsplit_once(" -> ") {
+        Some((_, next)) => next.trim(),
+        None => path,
+    }
+    .replace('\\', "/");
+    Some(CoreRepoChange { status: status.to_string(), path: normalized_path })
+}
+
+fn core_changes_summary(changes: &[CoreRepoChange], limit: usize) -> String {
+    changes
+        .iter()
+        .take(limit)
+        .map(|change| format!("{} {}", change.status, change.path))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 fn mark_task_failed(runtime: &SharedRuntime, task_id: u64, stage: &str, message: &str) {
-    let mut guard = runtime.inner.lock().unwrap();
+    let mut guard = runtime.lock();
     finish_task_for_error(&mut guard, task_id, stage, message);
 }
 
@@ -842,22 +1086,25 @@ pub fn start_core(
     request: Option<StartServiceRequest>,
 ) -> Result<ServiceSnapshot, String> {
     if let Some(request) = &request {
-        if let Some(service_id) = &request.service_id {
-            if service_id != GSUID_SERVICE_ID {
-                return Err("v1 仅支持启动 gsuid_core，NoneBot2 仅预留架构".to_string());
-            }
-        }
+        ensure_gsuid_service(request.service_id.as_deref())?;
     }
     let (_, paths) = app_paths(app)?;
+    if attach_persisted_core_if_running(app, runtime, &paths) {
+        let mut guard = runtime.lock();
+        return snapshot(&mut guard, &paths, core_git_metadata(app, &paths))
+            .into_iter()
+            .find(|service| service.service_id == GSUID_SERVICE_ID)
+            .ok_or_else(|| "无法读取 Core 状态".to_string());
+    }
     let core_dir = PathBuf::from(&paths.core_dir);
     if !core_dir.exists() {
         return Err("Core 源码不存在，请先执行一键初始化运行时".to_string());
     }
     let uv_program = toolchain::uv_program(app, &paths)?;
     let start_task_id = {
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         if guard.child.is_some() {
-            return snapshot(&mut guard, &paths, core_git_metadata(&paths))
+            return snapshot(&mut guard, &paths, core_git_metadata(app, &paths))
                 .into_iter()
                 .find(|service| service.service_id == GSUID_SERVICE_ID)
                 .ok_or_else(|| "无法读取 Core 状态".to_string());
@@ -868,22 +1115,13 @@ pub fn start_core(
         task_id
     };
 
-    let port = resolve_start_port(settings, request.as_ref()).map_err(|error| {
-        mark_task_failed(runtime, start_task_id, "port", &error);
-        error
+    let port = resolve_start_port(settings, request.as_ref()).inspect_err(|error| {
+        mark_task_failed(runtime, start_task_id, "port", error);
     })?;
     let mut command = Command::new(&uv_program);
     apply_default_child_env(&mut command);
     command
-        .args([
-            "run",
-            "--python",
-            "3.12",
-            "core",
-            "--host",
-            "127.0.0.1",
-            "--port",
-        ])
+        .args(["run", "--python", "3.12", "core", "--host", "127.0.0.1", "--port"])
         .arg(port.to_string())
         .current_dir(&core_dir)
         .stdout(Stdio::piped())
@@ -901,113 +1139,273 @@ pub fn start_core(
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     {
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         let started_at = Utc::now().to_rfc3339();
         let child_id = child.id();
         persist_core_process(&paths, child_id, port, &started_at).ok();
         guard.port = Some(port);
         guard.started_at = Some(started_at);
         guard.recent_error = None;
+        guard.core_file_log_ready = false;
+        guard.webconsole_available = false;
+        guard.next_webconsole_probe_at = None;
         guard.status = ServiceStatus::Starting;
         guard.child = Some(child);
         push_log(
             &mut guard,
             app,
             "system",
-            "success",
+            "info",
             &format!("Core 已启动: http://127.0.0.1:{port}/app"),
         );
     }
-    spawn_log_reader(
-        app.clone(),
-        runtime.inner.clone(),
-        stdout,
-        "stdout".to_string(),
-    );
-    spawn_log_reader(
-        app.clone(),
-        runtime.inner.clone(),
-        stderr,
-        "stderr".to_string(),
-    );
+    spawn_log_reader(app.clone(), runtime.inner.clone(), stdout, "stdout".to_string());
+    spawn_log_reader(app.clone(), runtime.inner.clone(), stderr, "stderr".to_string());
     spawn_core_file_log_poller(app.clone(), runtime.clone(), paths.clone());
+    spawn_webconsole_ready_probe(
+        app.clone(),
+        runtime.clone(),
+        paths.clone(),
+        port,
+        Some(start_task_id),
+        Duration::from_secs(60),
+    );
 
-    let base_url = format!("http://127.0.0.1:{port}");
-    let ready = match wait_for_webconsole(runtime, &base_url, Duration::from_secs(60)) {
-        Ok(ready) => ready,
-        Err(error) => {
-            let mut guard = runtime.inner.lock().unwrap();
-            if let Some(child) = guard.child.as_mut() {
-                force_kill_process_tree(child.id());
-                let _ = child.wait();
-            }
-            guard.child = None;
-            let _ = clear_persisted_core_process(&paths);
-            guard.port = None;
-            guard.started_at = None;
-            guard.status = ServiceStatus::Stopped;
-            guard.cancel_requested = false;
-            push_log(&mut guard, app, "system", "warn", &error);
-            finish_task(&mut guard, start_task_id, "cancelled", "cancelled", &error);
-            return Err(error);
-        }
-    };
-    {
-        let mut guard = runtime.inner.lock().unwrap();
-        guard.status = ServiceStatus::Running;
-        if ready {
-            push_log(
-                &mut guard,
-                app,
-                "system",
-                "success",
-                &format!("WebConsole 已就绪: {base_url}/app"),
-            );
-            finish_task(
-                &mut guard,
-                start_task_id,
-                "success",
-                "ready",
-                "Core 与 WebConsole 已就绪",
-            );
-        } else {
-            push_log(
-                &mut guard,
-                app,
-                "system",
-                "warn",
-                "Core 进程已启动，但 WebConsole 在 60 秒内未就绪",
-            );
-            finish_task(
-                &mut guard,
-                start_task_id,
-                "success",
-                "waiting_webconsole",
-                "Core 进程已启动，WebConsole 仍在等待",
-            );
-        }
-    }
-
-    let mut guard = runtime.inner.lock().unwrap();
-    snapshot(&mut guard, &paths, core_git_metadata(&paths))
+    let mut guard = runtime.lock();
+    snapshot(&mut guard, &paths, core_git_metadata(app, &paths))
         .into_iter()
         .find(|service| service.service_id == GSUID_SERVICE_ID)
         .ok_or_else(|| "无法读取 Core 状态".to_string())
 }
 
+pub fn ensure_webconsole_probe(app: &AppHandle, runtime: &SharedRuntime, paths: &AppPaths) {
+    let port = {
+        let guard = runtime.lock();
+        if !matches!(guard.status, ServiceStatus::Starting | ServiceStatus::Running) {
+            return;
+        }
+        if guard.webconsole_available {
+            return;
+        }
+        if let Some(next_probe_at) = guard.next_webconsole_probe_at {
+            if Instant::now() < next_probe_at {
+                return;
+            }
+        }
+        let Some(port) = guard.port else {
+            return;
+        };
+        port
+    };
+    spawn_webconsole_ready_probe(
+        app.clone(),
+        runtime.clone(),
+        paths.clone(),
+        port,
+        None,
+        Duration::from_secs(15),
+    );
+}
+
+fn spawn_webconsole_ready_probe(
+    app: AppHandle,
+    runtime: SharedRuntime,
+    paths: AppPaths,
+    port: u16,
+    task_id: Option<u64>,
+    timeout: Duration,
+) {
+    let should_spawn = {
+        let mut guard = runtime.lock();
+        if guard.webconsole_probe_active {
+            false
+        } else {
+            guard.webconsole_probe_active = true;
+            if let Some(task_id) = task_id {
+                update_task(&mut guard, task_id, "webconsole", "Core 已启动，等待 WebConsole 就绪");
+            }
+            true
+        }
+    };
+    if !should_spawn {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        let base_url = format!("http://127.0.0.1:{port}");
+        let started = Instant::now();
+        let outcome = loop {
+            if webconsole_available(&base_url) {
+                break WebConsoleProbeOutcome::Ready;
+            }
+
+            let state = {
+                let mut guard = runtime.lock();
+                refresh_child_exit_status(&mut guard, &paths);
+                if task_id.is_some() && guard.cancel_requested {
+                    WebConsoleProbeOutcome::Cancelled
+                } else if guard.child.is_none()
+                    && matches!(guard.status, ServiceStatus::Stopping | ServiceStatus::Stopped)
+                {
+                    WebConsoleProbeOutcome::Stopped
+                } else if guard.child.is_none()
+                    && !matches!(guard.status, ServiceStatus::Starting | ServiceStatus::Running)
+                {
+                    WebConsoleProbeOutcome::Exited(
+                        guard.recent_error.clone().unwrap_or_else(|| "Core 进程已退出".to_string()),
+                    )
+                } else if started.elapsed() >= timeout {
+                    WebConsoleProbeOutcome::Timeout
+                } else {
+                    WebConsoleProbeOutcome::Pending
+                }
+            };
+
+            match state {
+                WebConsoleProbeOutcome::Pending => std::thread::sleep(Duration::from_millis(700)),
+                outcome => break outcome,
+            }
+        };
+
+        finish_webconsole_probe(&app, &runtime, &paths, task_id, &base_url, outcome);
+    });
+}
+
+enum WebConsoleProbeOutcome {
+    Ready,
+    Timeout,
+    Cancelled,
+    Stopped,
+    Exited(String),
+    Pending,
+}
+
+fn finish_webconsole_probe(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    paths: &AppPaths,
+    task_id: Option<u64>,
+    base_url: &str,
+    outcome: WebConsoleProbeOutcome,
+) {
+    if matches!(outcome, WebConsoleProbeOutcome::Cancelled) {
+        let mut child = {
+            let mut guard = runtime.lock();
+            guard.child.take()
+        };
+        if let Some(child) = child.as_mut() {
+            force_kill_process_tree(child.id());
+            let _ = child.wait();
+        }
+    }
+
+    let mut guard = runtime.lock();
+    guard.webconsole_probe_active = false;
+    match outcome {
+        WebConsoleProbeOutcome::Ready => {
+            guard.status = ServiceStatus::Running;
+            guard.webconsole_available = true;
+            guard.next_webconsole_probe_at = None;
+            guard.recent_error = None;
+            push_log(
+                &mut guard,
+                app,
+                "system",
+                "info",
+                &format!("WebConsole 已就绪: {base_url}/app"),
+            );
+            if let Some(task_id) = task_id {
+                finish_task_if_running(
+                    &mut guard,
+                    task_id,
+                    "success",
+                    "ready",
+                    "Core 与 WebConsole 已就绪",
+                );
+            }
+        }
+        WebConsoleProbeOutcome::Timeout => {
+            if matches!(guard.status, ServiceStatus::Starting | ServiceStatus::Running) {
+                let should_report = task_id.is_some() || guard.status == ServiceStatus::Starting;
+                guard.status = ServiceStatus::Running;
+                guard.webconsole_available = false;
+                guard.next_webconsole_probe_at = Some(Instant::now() + Duration::from_secs(30));
+                if should_report {
+                    push_log(&mut guard, app, "system", "warn", "Core 已启动，WebConsole 仍在等待");
+                }
+                if let Some(task_id) = task_id {
+                    finish_task_if_running(
+                        &mut guard,
+                        task_id,
+                        "success",
+                        "waiting_webconsole",
+                        "Core 已启动，WebConsole 仍在等待",
+                    );
+                }
+            }
+        }
+        WebConsoleProbeOutcome::Cancelled => {
+            let _ = clear_persisted_core_process(paths);
+            guard.port = None;
+            guard.started_at = None;
+            guard.core_file_log_ready = false;
+            guard.webconsole_available = false;
+            guard.next_webconsole_probe_at = None;
+            guard.cancel_requested = false;
+            guard.status = ServiceStatus::Stopped;
+            push_log(&mut guard, app, "system", "warn", "任务已取消: 启动 Core");
+            if let Some(task_id) = task_id {
+                finish_task_if_running(
+                    &mut guard,
+                    task_id,
+                    "cancelled",
+                    "cancelled",
+                    "任务已取消: 启动 Core",
+                );
+            }
+        }
+        WebConsoleProbeOutcome::Stopped => {
+            let _ = clear_persisted_core_process(paths);
+            guard.port = None;
+            guard.started_at = None;
+            guard.core_file_log_ready = false;
+            guard.webconsole_available = false;
+            guard.next_webconsole_probe_at = None;
+            guard.cancel_requested = false;
+            guard.status = ServiceStatus::Stopped;
+            if let Some(task_id) = task_id {
+                finish_task_if_running(
+                    &mut guard,
+                    task_id,
+                    "cancelled",
+                    "stopped",
+                    "启动已被停止动作中断",
+                );
+            }
+        }
+        WebConsoleProbeOutcome::Exited(error) => {
+            guard.webconsole_available = false;
+            guard.next_webconsole_probe_at = None;
+            guard.status = ServiceStatus::Failed;
+            guard.recent_error = Some(error.clone());
+            push_log(&mut guard, app, "system", "error", &error);
+            if let Some(task_id) = task_id {
+                finish_task_if_running(&mut guard, task_id, "failed", "process", &error);
+            }
+        }
+        WebConsoleProbeOutcome::Pending => {}
+    }
+}
+
 pub fn stop_core(app: &AppHandle, runtime: &SharedRuntime) -> Result<(), String> {
     let (_, paths) = app_paths(app)?;
     let (task_id, child, persisted) = {
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         let task_id = start_task(&mut guard, "停止 Core", "stop", "正在停止 Core 进程");
         guard.status = ServiceStatus::Stopping;
         push_log(&mut guard, app, "system", "info", "正在停止 Core 进程");
         let child = guard.child.take();
-        let persisted = if child.is_none() {
-            load_persisted_core_process(&paths)
-        } else {
-            None
-        };
+        let persisted = if child.is_none() { load_persisted_core_process(&paths) } else { None };
         (task_id, child, persisted)
     };
 
@@ -1019,33 +1417,24 @@ pub fn stop_core(app: &AppHandle, runtime: &SharedRuntime) -> Result<(), String>
         StopOutcome::NoProcess
     };
 
-    let mut guard = runtime.inner.lock().unwrap();
+    let mut guard = runtime.lock();
     match outcome {
         StopOutcome::NoProcess => {
-            push_log(
-                &mut guard,
-                app,
-                "system",
-                "info",
-                "未检测到正在运行的 Core 进程",
-            );
+            push_log(&mut guard, app, "system", "info", "未检测到正在运行的 Core 进程");
         }
         StopOutcome::Graceful => {
             push_log(&mut guard, app, "system", "info", "Core 进程已优雅退出");
         }
         StopOutcome::Forced => {
-            push_log(
-                &mut guard,
-                app,
-                "system",
-                "warn",
-                "Core 优雅退出超时，已强制结束进程树",
-            );
+            push_log(&mut guard, app, "system", "warn", "Core 优雅退出超时，已强制结束进程树");
         }
     }
     let _ = clear_persisted_core_process(&paths);
     guard.port = None;
     guard.started_at = None;
+    guard.core_file_log_ready = false;
+    guard.webconsole_available = false;
+    guard.next_webconsole_probe_at = None;
     guard.status = ServiceStatus::Stopped;
     finish_task(&mut guard, task_id, "success", "done", "Core 进程已停止");
     Ok(())
@@ -1059,7 +1448,7 @@ pub fn repair_runtime(
 ) -> Result<(), String> {
     let (_, paths) = app_paths(app)?;
     let task_id = {
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         let message = repair_action_label(&request.action);
         start_task(&mut guard, "运行时修复", request.action.as_str(), &message)
     };
@@ -1077,15 +1466,11 @@ pub fn repair_runtime(
         _ => Err(format!("未知修复动作: {}", request.action)),
     };
 
-    let mut guard = runtime.inner.lock().unwrap();
+    let mut guard = runtime.lock();
     match &result {
-        Ok(_) => finish_task(
-            &mut guard,
-            task_id,
-            "success",
-            request.action.as_str(),
-            "修复动作完成",
-        ),
+        Ok(_) => {
+            finish_task(&mut guard, task_id, "success", request.action.as_str(), "修复动作完成")
+        }
         Err(error) => finish_task_for_error(&mut guard, task_id, request.action.as_str(), error),
     }
     result
@@ -1098,38 +1483,84 @@ pub fn core_update(
     request: CoreUpdateRequest,
 ) -> Result<CoreUpdateResult, String> {
     let (_, paths) = app_paths(app)?;
-    let action = request.action.as_str();
-    let channel = request.channel.unwrap_or_else(|| "latest".to_string());
+    let CoreUpdateRequest { action, channel, target_commit } = request;
+    let channel = channel.unwrap_or_else(|| "latest".to_string());
     let task_id = start_runtime_task(
         runtime,
         "Core 更新",
-        action,
+        action.as_str(),
         &format!("准备执行 Core {action}"),
     );
-    let result = match action {
-        "check" => check_core_update(app, runtime, settings, &paths, &channel, task_id),
-        "update" => apply_core_update(app, runtime, settings, &paths, &channel, task_id),
-        "rollback" => rollback_core_update(app, runtime, settings, &paths, task_id),
-        _ => Err(format!("未知 Core 更新动作: {action}")),
+    let step = CoreUpdateStep {
+        action: action.as_str(),
+        channel: &channel,
+        target_commit: target_commit.as_deref(),
+        task_id,
     };
+    let result = core_update_steps(app, runtime, settings, &paths, step);
     match &result {
         Ok(result) => {
-            finish_runtime_task(runtime, task_id, "success", action, &result.message);
-            push_system_log(app, runtime, "success", &result.message);
+            finish_runtime_task(runtime, task_id, "success", action.as_str(), &result.message);
+            push_system_log(app, runtime, "info", &result.message);
         }
         Err(error) => {
-            let mut guard = runtime.inner.lock().unwrap();
-            finish_task_for_error(&mut guard, task_id, action, error);
+            let mut guard = runtime.lock();
+            finish_task_for_error(&mut guard, task_id, action.as_str(), error);
             drop(guard);
-            let level = if is_task_cancelled_error(error) {
-                "warn"
-            } else {
-                "error"
-            };
+            let level = if is_task_cancelled_error(error) { "warn" } else { "error" };
             push_system_log(app, runtime, level, error);
         }
     }
     result
+}
+
+fn core_update_steps(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    settings: &Settings,
+    paths: &AppPaths,
+    step: CoreUpdateStep<'_>,
+) -> Result<CoreUpdateResult, String> {
+    let should_restart =
+        matches!(step.action, "update" | "rollback") && core_process_running(runtime, paths);
+    if should_restart {
+        update_runtime_task(runtime, step.task_id, "stop", "Core 正在运行，先停止后更新");
+        stop_core(app, runtime)
+            .map_err(|error| format!("Core 自动停止失败，已取消更新: {error}"))?;
+    }
+
+    let mut result = match step.action {
+        "check" => check_core_update(app, runtime, settings, paths, step.channel, step.task_id),
+        "list_commits" => {
+            list_core_commits(app, runtime, settings, paths, step.channel, step.task_id)
+        }
+        "clean" => clean_core_update_diff(app, runtime, settings, paths, step.task_id),
+        "update" => apply_core_update(app, runtime, settings, paths, step.channel, step.task_id),
+        "rollback" => {
+            rollback_core_update(app, runtime, settings, paths, step.target_commit, step.task_id)
+        }
+        _ => Err(format!("未知 Core 更新动作: {}", step.action)),
+    }?;
+
+    if should_restart {
+        update_runtime_task(runtime, step.task_id, "restart", "Core 更新完成，正在自动重启");
+        start_core(app, runtime, settings, None)
+            .map_err(|error| format!("{}，但自动重启 Core 失败: {error}", result.message))?;
+        result.message = format!("{}，已自动重启 Core", result.message);
+    }
+
+    Ok(result)
+}
+
+fn core_process_running(runtime: &SharedRuntime, paths: &AppPaths) -> bool {
+    let child_pid = {
+        let guard = runtime.lock();
+        guard.child.as_ref().map(|child| child.id())
+    };
+    if let Some(pid) = child_pid {
+        return process_alive(pid);
+    }
+    running_persisted_core_process(paths).is_some()
 }
 
 pub fn create_runtime_backup(
@@ -1137,22 +1568,13 @@ pub fn create_runtime_backup(
     runtime: &SharedRuntime,
 ) -> Result<RuntimeBackupResult, String> {
     let (_, paths) = app_paths(app)?;
-    let task_id = start_runtime_task(
-        runtime,
-        "运行时备份",
-        "prepare",
-        "准备导出运行时用户数据快照",
-    );
+    let task_id =
+        start_runtime_task(runtime, "运行时备份", "prepare", "准备导出运行时用户数据快照");
     let result = create_runtime_backup_inner(&paths);
     match &result {
         Ok(result) => {
             finish_runtime_task(runtime, task_id, "success", "done", "运行时备份已导出");
-            push_system_log(
-                app,
-                runtime,
-                "success",
-                &format!("运行时备份已导出: {}", result.path),
-            );
+            push_system_log(app, runtime, "info", &format!("运行时备份已导出: {}", result.path));
         }
         Err(error) => {
             finish_runtime_task(runtime, task_id, "failed", "error", error);
@@ -1179,12 +1601,7 @@ pub fn restore_runtime_backup(
     match &result {
         Ok(result) => {
             finish_runtime_task(runtime, task_id, "success", "done", "运行时备份已恢复");
-            push_system_log(
-                app,
-                runtime,
-                "success",
-                &format!("运行时备份已恢复: {}", result.path),
-            );
+            push_system_log(app, runtime, "info", &format!("运行时备份已恢复: {}", result.path));
         }
         Err(error) => {
             finish_runtime_task(runtime, task_id, "failed", "error", error);
@@ -1203,20 +1620,22 @@ fn check_core_update(
     task_id: u64,
 ) -> Result<CoreUpdateResult, String> {
     let core_dir = ensure_core_git_repo(paths)?;
+    let git_program = toolchain::git_program(app, paths)?;
     let envs = runtime_env(settings, paths);
     update_runtime_task(runtime, task_id, "fetch", "正在拉取远端更新信息");
     run_logged(
         app,
         runtime,
-        "git",
+        &git_program,
         &["fetch", "--all", "--tags", "--prune"],
         Some(&core_dir),
         &envs,
         Duration::from_secs(180),
     )?;
-    let current = git_output(&core_dir, &envs, &["rev-parse", "--short", "HEAD"])?;
-    let target_ref = resolve_update_target(&core_dir, &envs, channel)?;
-    let target = git_output(&core_dir, &envs, &["rev-parse", "--short", &target_ref])?;
+    let current = git_output(&git_program, &core_dir, &envs, &["rev-parse", "--short", "HEAD"])?;
+    let target_ref = resolve_update_target(&git_program, &core_dir, &envs, channel)?;
+    let target =
+        git_output(&git_program, &core_dir, &envs, &["rev-parse", "--short", &target_ref])?;
     let changed = current != target;
     Ok(CoreUpdateResult {
         action: "check".to_string(),
@@ -1224,12 +1643,87 @@ fn check_core_update(
         current_commit: Some(current.clone()),
         target_commit: Some(target.clone()),
         rollback_commit: load_core_rollback(paths).ok(),
+        commits: Vec::new(),
         changed,
         message: if changed {
             format!("发现 Core 更新: {current} -> {target} ({channel})")
         } else {
             format!("Core 已是当前通道最新: {current}")
         },
+    })
+}
+
+fn list_core_commits(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    settings: &Settings,
+    paths: &AppPaths,
+    channel: &str,
+    task_id: u64,
+) -> Result<CoreUpdateResult, String> {
+    let core_dir = ensure_core_git_repo(paths)?;
+    let git_program = toolchain::git_program(app, paths)?;
+    let envs = runtime_env(settings, paths);
+    update_runtime_task(runtime, task_id, "fetch", "正在拉取远端提交列表");
+    run_logged(
+        app,
+        runtime,
+        &git_program,
+        &["fetch", "--all", "--tags", "--prune"],
+        Some(&core_dir),
+        &envs,
+        Duration::from_secs(180),
+    )?;
+    let current_full = git_output(&git_program, &core_dir, &envs, &["rev-parse", "HEAD"])?;
+    let current_short =
+        git_output(&git_program, &core_dir, &envs, &["rev-parse", "--short", "HEAD"])?;
+    let rollback = load_core_rollback(paths).ok();
+    let commits =
+        core_commit_entries(&git_program, &core_dir, &envs, &current_full, rollback.as_deref())?;
+    let message = if commits.is_empty() {
+        "Core 没有可选择的提交记录".to_string()
+    } else {
+        format!("已加载 {} 个 Core 提交，可选择目标版本", commits.len())
+    };
+    Ok(CoreUpdateResult {
+        action: "list_commits".to_string(),
+        channel: channel.to_string(),
+        current_commit: Some(current_short),
+        target_commit: commits.first().map(|commit| commit.short_commit.clone()),
+        rollback_commit: rollback,
+        commits,
+        changed: false,
+        message,
+    })
+}
+
+fn clean_core_update_diff(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    settings: &Settings,
+    paths: &AppPaths,
+    task_id: u64,
+) -> Result<CoreUpdateResult, String> {
+    let core_dir = ensure_core_git_repo(paths)?;
+    let git_program = toolchain::git_program(app, paths)?;
+    let envs = runtime_env(settings, paths);
+    let cleaned =
+        clean_core_generated_diffs(app, runtime, &git_program, &core_dir, &envs, task_id)?;
+    let current = git_output(&git_program, &core_dir, &envs, &["rev-parse", "--short", "HEAD"])?;
+    let message = if cleaned.is_empty() {
+        "Core 没有需要清理的更新差异".to_string()
+    } else {
+        format!("Core 已清理更新差异: {}", cleaned.join("、"))
+    };
+    Ok(CoreUpdateResult {
+        action: "clean".to_string(),
+        channel: "local".to_string(),
+        current_commit: Some(current.clone()),
+        target_commit: Some(current),
+        rollback_commit: load_core_rollback(paths).ok(),
+        commits: Vec::new(),
+        changed: !cleaned.is_empty(),
+        message,
     })
 }
 
@@ -1242,37 +1736,37 @@ fn apply_core_update(
     task_id: u64,
 ) -> Result<CoreUpdateResult, String> {
     let core_dir = ensure_core_git_repo(paths)?;
+    let git_program = toolchain::git_program(app, paths)?;
     let envs = runtime_env(settings, paths);
-    if let Some(dirty) = core_repo_dirty(&core_dir, &envs)? {
+    let cleaned =
+        clean_core_generated_diffs(app, runtime, &git_program, &core_dir, &envs, task_id)?;
+    if let Some(dirty) = core_repo_dirty(&git_program, &core_dir, &envs)? {
         return Err(format!("Core 源码存在未提交修改，拒绝更新: {dirty}"));
     }
     update_runtime_task(runtime, task_id, "fetch", "正在拉取远端更新信息");
     run_logged(
         app,
         runtime,
-        "git",
+        &git_program,
         &["fetch", "--all", "--tags", "--prune"],
         Some(&core_dir),
         &envs,
         Duration::from_secs(180),
     )?;
-    let old_full = git_output(&core_dir, &envs, &["rev-parse", "HEAD"])?;
-    let old_short = git_output(&core_dir, &envs, &["rev-parse", "--short", "HEAD"])?;
-    let target_ref = resolve_update_target(&core_dir, &envs, channel)?;
-    let target_short = git_output(&core_dir, &envs, &["rev-parse", "--short", &target_ref])?;
+    let old_full = git_output(&git_program, &core_dir, &envs, &["rev-parse", "HEAD"])?;
+    let old_short = git_output(&git_program, &core_dir, &envs, &["rev-parse", "--short", "HEAD"])?;
+    let target_ref = resolve_update_target(&git_program, &core_dir, &envs, channel)?;
+    validate_core_commit(&git_program, &core_dir, &envs, &target_ref, "Core 目标提交")?;
+    let target_short =
+        git_output(&git_program, &core_dir, &envs, &["rev-parse", "--short", &target_ref])?;
     save_core_rollback(paths, &old_full)?;
 
-    update_runtime_task(
-        runtime,
-        task_id,
-        "checkout",
-        &format!("正在切换 Core 到 {target_ref}"),
-    );
+    update_runtime_task(runtime, task_id, "checkout", &format!("正在切换 Core 到 {target_ref}"));
     let result = if channel == "stable" {
         run_logged(
             app,
             runtime,
-            "git",
+            &git_program,
             &["checkout", "--detach", &target_ref],
             Some(&core_dir),
             &envs,
@@ -1282,7 +1776,7 @@ fn apply_core_update(
         run_logged(
             app,
             runtime,
-            "git",
+            &git_program,
             &["merge", "--ff-only", &target_ref],
             Some(&core_dir),
             &envs,
@@ -1293,7 +1787,7 @@ fn apply_core_update(
         let _ = run_logged(
             app,
             runtime,
-            "git",
+            &git_program,
             &["reset", "--hard", &old_full],
             Some(&core_dir),
             &envs,
@@ -1310,12 +1804,16 @@ fn apply_core_update(
         current_commit: Some(old_short.clone()),
         target_commit: Some(target_short.clone()),
         rollback_commit: Some(old_full),
+        commits: Vec::new(),
         changed: old_short != target_short,
-        message: if old_short == target_short {
-            format!("Core 已在目标提交: {target_short}")
-        } else {
-            format!("Core 已更新: {old_short} -> {target_short}")
-        },
+        message: update_message_with_cleaned(
+            if old_short == target_short {
+                format!("Core 已在目标提交: {target_short}")
+            } else {
+                format!("Core 已更新: {old_short} -> {target_short}")
+            },
+            &cleaned,
+        ),
     })
 }
 
@@ -1324,26 +1822,31 @@ fn rollback_core_update(
     runtime: &SharedRuntime,
     settings: &Settings,
     paths: &AppPaths,
+    target_commit: Option<&str>,
     task_id: u64,
 ) -> Result<CoreUpdateResult, String> {
     let core_dir = ensure_core_git_repo(paths)?;
+    let git_program = toolchain::git_program(app, paths)?;
     let envs = runtime_env(settings, paths);
-    if let Some(dirty) = core_repo_dirty(&core_dir, &envs)? {
+    let cleaned =
+        clean_core_generated_diffs(app, runtime, &git_program, &core_dir, &envs, task_id)?;
+    if let Some(dirty) = core_repo_dirty(&git_program, &core_dir, &envs)? {
         return Err(format!("Core 源码存在未提交修改，拒绝回滚: {dirty}"));
     }
-    let rollback = load_core_rollback(paths)?;
-    let current = git_output(&core_dir, &envs, &["rev-parse", "--short", "HEAD"])?;
-    let target = git_output(&core_dir, &envs, &["rev-parse", "--short", &rollback])?;
-    update_runtime_task(
-        runtime,
-        task_id,
-        "rollback",
-        &format!("正在回滚 Core 到 {target}"),
-    );
+    let rollback = match target_commit.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value.to_string(),
+        None => load_core_rollback(paths)?,
+    };
+    validate_core_commit(&git_program, &core_dir, &envs, &rollback, "Core 回滚目标")?;
+    let current_full = git_output(&git_program, &core_dir, &envs, &["rev-parse", "HEAD"])?;
+    let current = git_output(&git_program, &core_dir, &envs, &["rev-parse", "--short", "HEAD"])?;
+    let target = git_output(&git_program, &core_dir, &envs, &["rev-parse", "--short", &rollback])?;
+    save_core_rollback(paths, &current_full)?;
+    update_runtime_task(runtime, task_id, "rollback", &format!("正在回滚 Core 到 {target}"));
     run_logged(
         app,
         runtime,
-        "git",
+        &git_program,
         &["reset", "--hard", &rollback],
         Some(&core_dir),
         &envs,
@@ -1356,10 +1859,84 @@ fn rollback_core_update(
         channel: "rollback".to_string(),
         current_commit: Some(current.clone()),
         target_commit: Some(target.clone()),
-        rollback_commit: Some(rollback),
+        rollback_commit: Some(current_full),
+        commits: Vec::new(),
         changed: current != target,
-        message: format!("Core 已回滚: {current} -> {target}"),
+        message: update_message_with_cleaned(
+            format!("Core 已回滚: {current} -> {target}"),
+            &cleaned,
+        ),
     })
+}
+
+fn clean_core_generated_diffs(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    git_program: &str,
+    core_dir: &Path,
+    envs: &[(String, String)],
+    task_id: u64,
+) -> Result<Vec<String>, String> {
+    let changes = core_repo_changes(git_program, core_dir, envs, false)?;
+    if changes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut cleanable = Vec::new();
+    let mut blocked = Vec::new();
+    for change in changes {
+        if cleanable_core_update_path(&change.path) {
+            cleanable.push(change.path);
+        } else {
+            blocked.push(change);
+        }
+    }
+    if !blocked.is_empty() {
+        return Err(format!(
+            "Core 源码存在需要人工确认的修改，拒绝自动清理: {}",
+            core_changes_summary(&blocked, 5)
+        ));
+    }
+    if cleanable.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    update_runtime_task(
+        runtime,
+        task_id,
+        "clean",
+        &format!("正在清理 Core 更新差异: {}", cleanable.join("、")),
+    );
+    let mut args = vec![
+        "restore".to_string(),
+        "--staged".to_string(),
+        "--worktree".to_string(),
+        "--".to_string(),
+    ];
+    args.extend(cleanable.iter().cloned());
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    run_logged(
+        app,
+        runtime,
+        git_program,
+        &arg_refs,
+        Some(core_dir),
+        envs,
+        Duration::from_secs(60),
+    )?;
+    Ok(cleanable)
+}
+
+fn cleanable_core_update_path(path: &str) -> bool {
+    CLEANABLE_CORE_UPDATE_PATHS.contains(&path)
+}
+
+fn update_message_with_cleaned(message: String, cleaned: &[String]) -> String {
+    if cleaned.is_empty() {
+        message
+    } else {
+        format!("{message}；已清理更新差异: {}", cleaned.join("、"))
+    }
 }
 
 fn ensure_core_git_repo(paths: &AppPaths) -> Result<PathBuf, String> {
@@ -1372,12 +1949,13 @@ fn ensure_core_git_repo(paths: &AppPaths) -> Result<PathBuf, String> {
 }
 
 fn resolve_update_target(
+    git_program: &str,
     core_dir: &Path,
     envs: &[(String, String)],
     channel: &str,
 ) -> Result<String, String> {
     if channel == "stable" {
-        let tags = git_output(core_dir, envs, &["tag", "--sort=-v:refname"])?;
+        let tags = git_output(git_program, core_dir, envs, &["tag", "--sort=-v:refname"])?;
         return tags
             .lines()
             .map(str::trim)
@@ -1386,6 +1964,7 @@ fn resolve_update_target(
             .ok_or_else(|| "远端未发现可用 tag，无法使用 stable 通道".to_string());
     }
     if let Ok(upstream) = git_output(
+        git_program,
         core_dir,
         envs,
         &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
@@ -1395,20 +1974,96 @@ fn resolve_update_target(
         }
     }
     for candidate in ["origin/master", "origin/main"] {
-        if git_output(core_dir, envs, &["rev-parse", "--verify", candidate]).is_ok() {
+        if git_output(git_program, core_dir, envs, &["rev-parse", "--verify", candidate]).is_ok() {
             return Ok(candidate.to_string());
         }
     }
     Err("无法识别 Core 远端分支，请检查 git remote/upstream".to_string())
 }
 
-fn git_output(core_dir: &Path, envs: &[(String, String)], args: &[&str]) -> Result<String, String> {
-    let output = run_command_timeout("git", args, Some(core_dir), envs, Duration::from_secs(30))?;
+fn core_commit_entries(
+    git_program: &str,
+    core_dir: &Path,
+    envs: &[(String, String)],
+    current_commit: &str,
+    rollback_commit: Option<&str>,
+) -> Result<Vec<CoreCommitEntry>, String> {
+    let output = git_output(
+        git_program,
+        core_dir,
+        envs,
+        &[
+            "log",
+            "--all",
+            "--date=iso-strict",
+            "--pretty=format:%H%x1f%h%x1f%cI%x1f%an%x1f%s",
+            "-n",
+            "80",
+        ],
+    )?;
+    Ok(output
+        .lines()
+        .filter_map(|line| parse_core_commit_entry(line, current_commit, rollback_commit))
+        .collect())
+}
+
+fn parse_core_commit_entry(
+    line: &str,
+    current_commit: &str,
+    rollback_commit: Option<&str>,
+) -> Option<CoreCommitEntry> {
+    let mut parts = line.splitn(5, '\x1f');
+    let commit = parts.next()?.trim();
+    let short_commit = parts.next()?.trim();
+    let committed_at = parts.next()?.trim();
+    let author = parts.next()?.trim();
+    let subject = parts.next()?.trim();
+    if commit.is_empty() || short_commit.is_empty() {
+        return None;
+    }
+    let rollback_matches = rollback_commit
+        .is_some_and(|rollback| commit.starts_with(rollback) || rollback.starts_with(commit));
+    Some(CoreCommitEntry {
+        commit: commit.to_string(),
+        short_commit: short_commit.to_string(),
+        subject: if subject.is_empty() {
+            "(无提交说明)".to_string()
+        } else {
+            subject.to_string()
+        },
+        author: if author.is_empty() { "unknown".to_string() } else { author.to_string() },
+        committed_at: committed_at.to_string(),
+        is_current: commit == current_commit,
+        is_rollback: rollback_matches,
+    })
+}
+
+fn git_output(
+    git_program: &str,
+    core_dir: &Path,
+    envs: &[(String, String)],
+    args: &[&str],
+) -> Result<String, String> {
+    let output =
+        run_command_timeout(git_program, args, Some(core_dir), envs, Duration::from_secs(30))?;
     if output.success {
         Ok(output.stdout.trim().to_string())
     } else {
         Err(first_non_empty(&output.stderr, &output.stdout))
     }
+}
+
+fn validate_core_commit(
+    git_program: &str,
+    core_dir: &Path,
+    envs: &[(String, String)],
+    revision: &str,
+    label: &str,
+) -> Result<(), String> {
+    let commit_spec = format!("{revision}^{{commit}}");
+    git_output(git_program, core_dir, envs, &["cat-file", "-e", &commit_spec])
+        .map(|_| ())
+        .map_err(|error| format!("{label} 不可用: {revision}；git: {error}"))
 }
 
 fn first_non_empty(a: &str, b: &str) -> String {
@@ -1447,288 +2102,16 @@ fn load_core_rollback(paths: &AppPaths) -> Result<String, String> {
         })
 }
 
-fn create_runtime_backup_inner(paths: &AppPaths) -> Result<RuntimeBackupResult, String> {
-    let backup_dir = PathBuf::from(&paths.backups_dir);
-    fs::create_dir_all(&backup_dir)
-        .map_err(|error| format!("创建备份目录失败 {}: {error}", backup_dir.display()))?;
-    let path = backup_dir.join(format!(
-        "gsdesk-runtime-{}.zip",
-        Utc::now().format("%Y%m%d%H%M%S%9f")
-    ));
-    let file = File::create(&path)
-        .map_err(|error| format!("创建备份文件失败 {}: {error}", path.display()))?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    let mut included = Vec::new();
-
-    let settings_path = PathBuf::from(&paths.settings_file);
-    if settings_path.is_file() {
-        let settings = fs::read_to_string(&settings_path).map_err(|error| {
-            format!("读取设置备份文件失败 {}: {error}", settings_path.display())
-        })?;
-        add_backup_text(
-            &mut zip,
-            options,
-            "settings.redacted.json",
-            &redact_secrets(&settings),
-        )?;
-        included.push("settings.redacted.json".to_string());
-    }
-
-    for (label, path) in [
-        ("core-data", PathBuf::from(&paths.core_dir).join("data")),
-        ("core-config", PathBuf::from(&paths.core_dir).join("config")),
-        (
-            "core-plugins",
-            PathBuf::from(&paths.core_dir).join("plugins"),
-        ),
-        ("logs", PathBuf::from(&paths.logs_dir)),
-    ] {
-        if path.is_file() {
-            add_backup_file(&mut zip, options, &path, label)?;
-            included.push(label.to_string());
-        } else if path.is_dir() {
-            add_backup_dir(&mut zip, options, &path, label)?;
-            included.push(label.to_string());
-        }
-    }
-    zip.finish()
-        .map_err(|error| format!("写入备份 zip 失败 {}: {error}", path.display()))?;
-    Ok(RuntimeBackupResult {
-        path: path.to_string_lossy().to_string(),
-        included,
-    })
-}
-
-fn restore_runtime_backup_inner(
-    paths: &AppPaths,
-    requested_path: Option<&str>,
-) -> Result<RuntimeRestoreResult, String> {
-    let backup_path = resolve_runtime_backup_path(paths, requested_path)?;
-    let safety_backup = create_runtime_backup_inner(paths)
-        .ok()
-        .map(|backup| backup.path);
-    let file = File::open(&backup_path)
-        .map_err(|error| format!("打开运行时备份失败 {}: {error}", backup_path.display()))?;
-    let mut archive = zip::ZipArchive::new(file)
-        .map_err(|error| format!("读取运行时备份 zip 失败 {}: {error}", backup_path.display()))?;
-
-    let restore_targets = restore_target_dirs(paths);
-    let mut required_roots = Vec::new();
-    for index in 0..archive.len() {
-        let entry = archive
-            .by_index(index)
-            .map_err(|error| format!("读取备份条目失败: {error}"))?;
-        let Some(root) = backup_entry_root(entry.name()) else {
-            continue;
-        };
-        if restore_targets.contains_key(root) && !required_roots.contains(&root.to_string()) {
-            required_roots.push(root.to_string());
-        }
-    }
-    if required_roots.is_empty() {
-        return Err(
-            "运行时备份中没有可恢复的 core-data/core-config/core-plugins/logs 条目".to_string(),
-        );
-    }
-
-    for root in &required_roots {
-        if let Some(target) = restore_targets.get(root.as_str()) {
-            if target.exists() {
-                fs::remove_dir_all(target)
-                    .map_err(|error| format!("清理恢复目标失败 {}: {error}", target.display()))?;
-            }
-            fs::create_dir_all(target)
-                .map_err(|error| format!("创建恢复目标失败 {}: {error}", target.display()))?;
-        }
-    }
-
-    for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| format!("读取备份条目失败: {error}"))?;
-        let name = entry.name().replace('\\', "/");
-        let Some(root) = backup_entry_root(&name) else {
-            continue;
-        };
-        let Some(target_root) = restore_targets.get(root) else {
-            continue;
-        };
-        let Some(enclosed) = entry.enclosed_name().map(PathBuf::from) else {
-            return Err(format!("备份条目路径不安全: {name}"));
-        };
-        let relative = enclosed
-            .strip_prefix(root)
-            .map_err(|_| format!("备份条目路径不匹配: {name}"))?;
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
-        let target = target_root.join(relative);
-        if entry.is_dir() {
-            fs::create_dir_all(&target)
-                .map_err(|error| format!("创建恢复目录失败 {}: {error}", target.display()))?;
-        } else {
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("创建恢复目录失败 {}: {error}", parent.display()))?;
-            }
-            let mut output = File::create(&target)
-                .map_err(|error| format!("创建恢复文件失败 {}: {error}", target.display()))?;
-            std::io::copy(&mut entry, &mut output)
-                .map_err(|error| format!("写入恢复文件失败 {}: {error}", target.display()))?;
-        }
-    }
-
-    Ok(RuntimeRestoreResult {
-        path: backup_path.to_string_lossy().to_string(),
-        safety_backup,
-        restored: required_roots,
-    })
-}
-
 fn ensure_core_not_running(runtime: &SharedRuntime, paths: &AppPaths) -> Result<(), String> {
-    let guard = runtime.inner.lock().unwrap();
+    let guard = runtime.lock();
     if guard.child.is_some() {
         return Err("Core 正在运行，恢复备份前请先停止 Core".to_string());
     }
     drop(guard);
-    if let Some(record) = load_persisted_core_process(paths) {
-        if process_alive(record.pid) {
-            return Err(format!(
-                "检测到遗留 Core 进程 pid={}，恢复备份前请先停止 Core",
-                record.pid
-            ));
-        }
+    if let Some(record) = running_persisted_core_process(paths) {
+        return Err(format!("检测到遗留 Core 进程 pid={}，恢复备份前请先停止 Core", record.pid));
     }
     Ok(())
-}
-
-fn resolve_runtime_backup_path(
-    paths: &AppPaths,
-    requested_path: Option<&str>,
-) -> Result<PathBuf, String> {
-    let backup_dir = PathBuf::from(&paths.backups_dir);
-    match requested_path {
-        Some(path) if !path.trim().is_empty() => {
-            let path = PathBuf::from(path);
-            ensure_path_under_dir(&path, &backup_dir)?;
-            Ok(path)
-        }
-        _ => latest_runtime_backup(&backup_dir),
-    }
-}
-
-fn latest_runtime_backup(backup_dir: &Path) -> Result<PathBuf, String> {
-    let mut files = fs::read_dir(backup_dir)
-        .map_err(|error| format!("读取备份目录失败 {}: {error}", backup_dir.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .map(|name| name.starts_with("gsdesk-runtime-") && name.ends_with(".zip"))
-                    .unwrap_or(false)
-        })
-        .filter_map(|path| {
-            let modified = fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .ok()?;
-            Some((path, modified))
-        })
-        .collect::<Vec<_>>();
-    files.sort_by_key(|(_, modified)| *modified);
-    files
-        .pop()
-        .map(|(path, _)| path)
-        .ok_or_else(|| "没有找到可恢复的运行时备份，请先导出备份快照".to_string())
-}
-
-fn ensure_path_under_dir(path: &Path, dir: &Path) -> Result<(), String> {
-    let path = normalize_path(path)?;
-    let dir = normalize_path(dir)?;
-    if path.starts_with(&dir) {
-        Ok(())
-    } else {
-        Err(format!(
-            "出于安全限制，只允许恢复备份目录内的 zip: {}",
-            dir.display()
-        ))
-    }
-}
-
-fn restore_target_dirs(paths: &AppPaths) -> std::collections::HashMap<&'static str, PathBuf> {
-    [
-        ("core-data", PathBuf::from(&paths.core_dir).join("data")),
-        ("core-config", PathBuf::from(&paths.core_dir).join("config")),
-        (
-            "core-plugins",
-            PathBuf::from(&paths.core_dir).join("plugins"),
-        ),
-        ("logs", PathBuf::from(&paths.logs_dir)),
-    ]
-    .into_iter()
-    .collect()
-}
-
-fn backup_entry_root(name: &str) -> Option<&str> {
-    name.split('/')
-        .next()
-        .filter(|root| matches!(*root, "core-data" | "core-config" | "core-plugins" | "logs"))
-}
-
-fn add_backup_dir(
-    zip: &mut zip::ZipWriter<File>,
-    options: FileOptions,
-    dir: &Path,
-    prefix: &str,
-) -> Result<(), String> {
-    for entry in
-        fs::read_dir(dir).map_err(|error| format!("读取备份目录失败 {}: {error}", dir.display()))?
-    {
-        let entry = entry.map_err(|error| format!("读取备份目录项失败: {error}"))?;
-        let path = entry.path();
-        let name = format!(
-            "{}/{}",
-            prefix,
-            entry.file_name().to_string_lossy().replace('\\', "/")
-        );
-        if path.is_dir() {
-            add_backup_dir(zip, options, &path, &name)?;
-        } else if path.is_file() {
-            add_backup_file(zip, options, &path, &name)?;
-        }
-    }
-    Ok(())
-}
-
-fn add_backup_file(
-    zip: &mut zip::ZipWriter<File>,
-    options: FileOptions,
-    path: &Path,
-    name: &str,
-) -> Result<(), String> {
-    let name = name.replace('\\', "/");
-    zip.start_file(name, options)
-        .map_err(|error| format!("写入备份条目失败 {}: {error}", path.display()))?;
-    let mut file = File::open(path)
-        .map_err(|error| format!("打开备份文件失败 {}: {error}", path.display()))?;
-    std::io::copy(&mut file, zip)
-        .map_err(|error| format!("写入备份文件失败 {}: {error}", path.display()))?;
-    Ok(())
-}
-
-fn add_backup_text(
-    zip: &mut zip::ZipWriter<File>,
-    options: FileOptions,
-    name: &str,
-    content: &str,
-) -> Result<(), String> {
-    zip.start_file(name.replace('\\', "/"), options)
-        .map_err(|error| format!("写入备份条目失败 {name}: {error}"))?;
-    zip.write_all(content.as_bytes())
-        .map_err(|error| format!("写入备份文本失败 {name}: {error}"))
 }
 
 fn sync_dependencies(
@@ -1759,19 +2142,13 @@ fn reclone_core(
     paths: &AppPaths,
 ) -> Result<(), String> {
     let core_dir = PathBuf::from(&paths.core_dir);
-    let core_parent = core_dir
-        .parent()
-        .ok_or_else(|| "Core 路径缺少父目录".to_string())?
-        .to_path_buf();
+    let core_parent =
+        core_dir.parent().ok_or_else(|| "Core 路径缺少父目录".to_string())?.to_path_buf();
     fs::create_dir_all(&core_parent).map_err(|error| format!("创建 Core 父目录失败: {error}"))?;
 
-    let backup_dir = PathBuf::from(&paths.runtime)
-        .join("backups")
-        .join(format!("gsuid_core-{}", Utc::now().format("%Y%m%d%H%M%S")));
+    let backup_dir = reclone_backup_dir(paths, &core_dir)?;
     if core_dir.exists() {
-        let backup_parent = backup_dir
-            .parent()
-            .ok_or_else(|| "备份路径缺少父目录".to_string())?;
+        let backup_parent = backup_dir.parent().ok_or_else(|| "备份路径缺少父目录".to_string())?;
         fs::create_dir_all(backup_parent)
             .map_err(|error| format!("创建 Core 备份目录失败: {error}"))?;
         fs::rename(&core_dir, &backup_dir)
@@ -1779,15 +2156,9 @@ fn reclone_core(
     }
 
     let envs = runtime_env(settings, paths);
-    let clone_result = run_logged(
-        app,
-        runtime,
-        "git",
-        &["clone", selected_source(settings), "gsuid_core"],
-        Some(core_parent.as_path()),
-        &envs,
-        Duration::from_secs(300),
-    );
+    let git_program = toolchain::git_program(app, paths)?;
+    let clone_result =
+        clone_core_repo(app, runtime, &git_program, selected_source(settings), &core_dir, &envs);
     if let Err(error) = clone_result {
         if backup_dir.exists() && !core_dir.exists() {
             let _ = fs::rename(&backup_dir, &core_dir);
@@ -1804,17 +2175,62 @@ fn reclone_core(
                     .map_err(|error| format!("恢复用户目录失败 {name}: {error}"))?;
             }
         }
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         push_log(
             &mut guard,
             app,
             "system",
-            "success",
+            "info",
             &format!("Core 已重新 clone，旧目录备份在 {}", backup_dir.display()),
         );
     }
 
     sync_dependencies(app, runtime, settings, paths)
+}
+
+fn source_state_message(state: &CoreSourceState) -> &str {
+    match state {
+        CoreSourceState::GitRepo => "更新现有 gsuid_core 源码",
+        CoreSourceState::SourceTree => "使用现有 Core 源码目录",
+        CoreSourceState::Missing => "拉取 gsuid_core 源码",
+        CoreSourceState::Invalid(_) => "检查 Core 源码目录",
+    }
+}
+
+fn clone_core_repo(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    git_program: &str,
+    source: &str,
+    core_dir: &Path,
+    envs: &[(String, String)],
+) -> Result<(), String> {
+    let target = core_dir.to_string_lossy().to_string();
+    run_logged(
+        app,
+        runtime,
+        git_program,
+        &["clone", source, target.as_str()],
+        None,
+        envs,
+        Duration::from_secs(300),
+    )
+}
+
+fn reclone_backup_dir(paths: &AppPaths, core_dir: &Path) -> Result<PathBuf, String> {
+    let timestamp = Utc::now().format("%Y%m%d%H%M%S");
+    let runtime = PathBuf::from(&paths.runtime);
+    if core_dir.starts_with(&runtime) {
+        return Ok(runtime.join("backups").join(format!("gsuid_core-{timestamp}")));
+    }
+    let parent = core_dir.parent().ok_or_else(|| "Core 路径缺少父目录".to_string())?;
+    let name =
+        core_dir.file_name().and_then(|value| value.to_str()).filter(|value| !value.is_empty());
+    let backup_name = match name {
+        Some(value) => format!("{value}-backup-{timestamp}"),
+        None => format!("gsuid_core-backup-{timestamp}"),
+    };
+    Ok(parent.join(backup_name))
 }
 
 fn copy_dir_all(source: &Path, target: &Path) -> std::io::Result<()> {
@@ -1869,22 +2285,6 @@ fn normalize_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-pub fn service_port_available(port: u16) -> bool {
-    TcpListener::bind(("127.0.0.1", port)).is_ok()
-}
-
-pub fn select_port() -> u16 {
-    for port in 8765..=8865 {
-        if service_port_available(port) {
-            return port;
-        }
-    }
-    TcpListener::bind(("127.0.0.1", 0))
-        .ok()
-        .and_then(|listener| listener.local_addr().ok().map(|addr| addr.port()))
-        .unwrap_or(8765)
-}
-
 fn resolve_start_port(
     settings: &Settings,
     request: Option<&StartServiceRequest>,
@@ -1904,7 +2304,7 @@ fn resolve_fixed_port(port: u16, label: &str) -> Result<u16, String> {
     }
     if !service_port_available(port) {
         return Err(format!(
-            "{label} {port} 已被占用，请关闭占用进程，或在网络与设置里清空固定端口改回自动选择"
+            "{label} {port} 已被占用，请关闭占用进程，或在网络设置里清空固定端口改回自动选择"
         ));
     }
     Ok(port)
@@ -1914,17 +2314,14 @@ pub fn runtime_env(settings: &Settings, paths: &crate::models::AppPaths) -> Vec<
     let mut envs = env_from_settings(settings);
     envs.push(("UV_PROJECT_ENVIRONMENT".to_string(), paths.venv_dir.clone()));
     envs.push(("UV_CACHE_DIR".to_string(), paths.uv_cache_dir.clone()));
-    envs.push((
-        "UV_PYTHON_INSTALL_DIR".to_string(),
-        paths.uv_python_dir.clone(),
-    ));
+    envs.push(("UV_PYTHON_INSTALL_DIR".to_string(), paths.uv_python_dir.clone()));
+    envs.push(("UV_PYTHON_DOWNLOADS".to_string(), "never".to_string()));
     envs.push(("PYTHONUTF8".to_string(), "1".to_string()));
-    envs.push((
-        "PYTHONIOENCODING".to_string(),
-        PYTHON_IO_ENCODING.to_string(),
-    ));
+    envs.push(("PYTHONIOENCODING".to_string(), PYTHON_IO_ENCODING.to_string()));
     envs.push(("PYTHONUNBUFFERED".to_string(), "1".to_string()));
     envs.push(("UV_NO_PROGRESS".to_string(), "1".to_string()));
+    envs.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+    envs.push(("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()));
     envs.push(("NO_COLOR".to_string(), "1".to_string()));
     envs.push(("FORCE_COLOR".to_string(), "0".to_string()));
     envs.push(("CLICOLOR".to_string(), "0".to_string()));
@@ -1945,30 +2342,6 @@ pub fn selected_source(settings: &Settings) -> &str {
     }
 }
 
-pub fn latest_core_log_file(paths: &AppPaths) -> Option<PathBuf> {
-    let logs_dir = PathBuf::from(&paths.core_dir).join("data").join("logs");
-    fs::read_dir(logs_dir)
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(|extension| {
-                        extension.eq_ignore_ascii_case("log")
-                            || extension.eq_ignore_ascii_case("jsonl")
-                    })
-                    .unwrap_or(false)
-        })
-        .max_by_key(|path| {
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .ok()
-        })
-}
-
 fn run_logged(
     app: &AppHandle,
     runtime: &SharedRuntime,
@@ -1979,23 +2352,14 @@ fn run_logged(
     timeout: Duration,
 ) -> Result<(), String> {
     {
-        let mut guard = runtime.inner.lock().unwrap();
-        push_log(
-            &mut guard,
-            app,
-            "system",
-            "info",
-            &format!("执行: {program} {}", args.join(" ")),
-        );
+        let mut guard = runtime.lock();
+        push_log(&mut guard, app, "system", "info", &format!("执行: {program} {}", args.join(" ")));
     }
 
     let started = Instant::now();
     let mut command = Command::new(program);
     apply_default_child_env(&mut command);
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -2004,9 +2368,7 @@ fn run_logged(
     }
     command.env_remove(LEGACY_WINDOWS_STDIO_ENV);
 
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("执行命令失败 {program}: {error}"))?;
+    let mut child = command.spawn().map_err(|error| format!("执行命令失败 {program}: {error}"))?;
     let collected = Arc::new(Mutex::new(VecDeque::new()));
     let stdout_reader = spawn_command_log_reader(
         app.clone(),
@@ -2060,7 +2422,7 @@ fn run_logged(
     let success = status.is_some_and(|status| status.success());
     if cancelled {
         let message = task_cancelled_message(program, args);
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         guard.cancel_requested = false;
         push_log(&mut guard, app, "system", "warn", &message);
         return Err(message);
@@ -2077,7 +2439,7 @@ fn run_logged(
         } else {
             format!("{base_message}\n最近输出:\n{tail}")
         };
-        let mut guard = runtime.inner.lock().unwrap();
+        let mut guard = runtime.lock();
         guard.status = ServiceStatus::Failed;
         guard.recent_error = Some(message.clone());
         push_log(&mut guard, app, "system", "error", &message);
@@ -2087,7 +2449,7 @@ fn run_logged(
 }
 
 fn task_cancel_requested(runtime: &SharedRuntime) -> bool {
-    runtime.inner.lock().unwrap().cancel_requested
+    runtime.lock().cancel_requested
 }
 
 fn task_cancelled_message(program: &str, args: &[&str]) -> String {
@@ -2157,11 +2519,7 @@ fn flush_command_log_bytes(
         push_log_text_filtered_collected(runtime, app, stream, filter, collected, &chunk);
     }
 
-    if final_flush && !pending.is_empty() {
-        let chunk = String::from_utf8_lossy(pending).to_string();
-        pending.clear();
-        push_log_text_filtered_collected(runtime, app, stream, filter, collected, &chunk);
-    } else if pending.len() > 16 * 1024 {
+    if (final_flush && !pending.is_empty()) || pending.len() > 16 * 1024 {
         let chunk = String::from_utf8_lossy(pending).to_string();
         pending.clear();
         push_log_text_filtered_collected(runtime, app, stream, filter, collected, &chunk);
@@ -2191,7 +2549,7 @@ fn collect_command_log_records(collected: &Arc<Mutex<VecDeque<String>>>, records
     if records.is_empty() {
         return;
     }
-    let mut guard = collected.lock().unwrap();
+    let mut guard = lock_command_records(collected);
     for record in records {
         guard.push_back(record.clone());
         while guard.len() > 40 {
@@ -2201,14 +2559,7 @@ fn collect_command_log_records(collected: &Arc<Mutex<VecDeque<String>>>, records
 }
 
 fn command_log_tail(collected: &Arc<Mutex<VecDeque<String>>>) -> String {
-    let tail = collected
-        .lock()
-        .unwrap()
-        .iter()
-        .rev()
-        .take(8)
-        .cloned()
-        .collect::<Vec<_>>();
+    let tail = lock_command_records(collected).iter().rev().take(8).cloned().collect::<Vec<_>>();
     tail.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
@@ -2274,11 +2625,7 @@ fn flush_log_bytes(
         push_log_text_filtered(runtime, app, stream, filter, &chunk);
     }
 
-    if final_flush && !pending.is_empty() {
-        let chunk = String::from_utf8_lossy(pending).to_string();
-        pending.clear();
-        push_log_text_filtered(runtime, app, stream, filter, &chunk);
-    } else if pending.len() > 16 * 1024 {
+    if (final_flush && !pending.is_empty()) || pending.len() > 16 * 1024 {
         let chunk = String::from_utf8_lossy(pending).to_string();
         pending.clear();
         push_log_text_filtered(runtime, app, stream, filter, &chunk);
@@ -2344,66 +2691,46 @@ fn push_log_records(
         return;
     }
 
-    let mut guard = runtime.lock().unwrap();
+    let mut guard = lock_service_runtime(runtime);
     for record in records {
+        if should_suppress_console_record(&guard, stream, &record) {
+            continue;
+        }
         let level = classify_level(&record);
         push_log(&mut guard, app, stream, level, &record);
     }
 }
 
-#[derive(Default)]
-struct ConsoleLogFilter {
-    pending_python_logging_error: Option<Vec<String>>,
+fn should_suppress_console_record(runtime: &ServiceRuntime, stream: &str, record: &str) -> bool {
+    if is_standalone_python_gbk_encoding_error(record) {
+        return true;
+    }
+    if !matches!(stream, "stdout" | "stderr") || !runtime.core_file_log_ready {
+        return false;
+    }
+    is_core_structured_console_record(record) || is_core_lifecycle_console_record(record)
 }
 
-impl ConsoleLogFilter {
-    fn apply(&mut self, records: Vec<String>) -> Vec<String> {
-        let mut output = Vec::new();
-        for record in records {
-            if let Some(block) = &mut self.pending_python_logging_error {
-                block.push(record);
-                if block.len() > 160 {
-                    output.extend(self.pending_python_logging_error.take().unwrap_or_default());
-                    continue;
-                }
-                if block
-                    .last()
-                    .is_some_and(|line| is_python_logging_error_block_end(line))
-                {
-                    let block = self.pending_python_logging_error.take().unwrap_or_default();
-                    if !is_python_gbk_logging_noise(&block) {
-                        output.extend(block);
-                    }
-                }
-                continue;
-            }
-
-            if is_python_logging_error_block_start(&record) {
-                self.pending_python_logging_error = Some(vec![record]);
-                continue;
-            }
-
-            if is_standalone_python_gbk_encoding_error(&record) {
-                continue;
-            }
-
-            output.push(record);
-        }
-        output
-    }
-
-    fn flush_pending(&mut self) -> Vec<String> {
-        let block = self.pending_python_logging_error.take().unwrap_or_default();
-        if is_python_gbk_logging_noise(&block) {
-            Vec::new()
-        } else {
-            block
-        }
-    }
+fn is_core_structured_console_record(record: &str) -> bool {
+    is_structured_log_prefix_at(record.trim_start().as_bytes(), 0)
 }
 
-fn push_core_file_log(runtime: &mut ServiceRuntime, app: &AppHandle, record: CoreFileLogRecord) {
-    remove_console_duplicate(runtime, &record.message);
+fn is_core_lifecycle_console_record(record: &str) -> bool {
+    let trimmed = record.trim();
+    trimmed.starts_with("Started server process")
+        || trimmed.starts_with("Waiting for application startup")
+        || trimmed.starts_with("Application startup complete")
+        || trimmed.starts_with("Uvicorn running on ")
+}
+
+fn push_core_file_log(
+    runtime: &mut ServiceRuntime,
+    record: CoreFileLogRecord,
+    remove_duplicate_console: bool,
+) -> LogEntry {
+    if remove_duplicate_console {
+        remove_console_duplicate(runtime, &record.message);
+    }
     let line = record.to_display_line();
     let entry = LogEntry {
         id: runtime.next_log_id,
@@ -2418,7 +2745,7 @@ fn push_core_file_log(runtime: &mut ServiceRuntime, app: &AppHandle, record: Cor
     };
     runtime.next_log_id += 1;
     push_log_entry(runtime, entry.clone());
-    let _ = app.emit("gsdesk-log", &entry);
+    entry
 }
 
 fn remove_console_duplicate(runtime: &mut ServiceRuntime, event: &str) {
@@ -2470,7 +2797,7 @@ fn persist_log(app: &AppHandle, entry: &LogEntry) {
         return;
     }
     if matches!(entry.stream.as_str(), "stdout" | "stderr")
-        && matches!(entry.level.as_str(), "info" | "success")
+        && matches!(entry.level.as_str(), "debug" | "info")
     {
         return;
     }
@@ -2511,123 +2838,6 @@ fn sanitize_persisted_core_log_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn sanitize_persisted_log_content(content: &str) -> String {
-    #[derive(Default)]
-    struct PendingBlock {
-        original_lines: Vec<String>,
-        payloads: Vec<String>,
-    }
-
-    let mut output = Vec::new();
-    let mut pending: Option<PendingBlock> = None;
-
-    for line in content.lines() {
-        let payload = persisted_log_payload(line).trim().to_string();
-        if let Some(block) = &mut pending {
-            block.original_lines.push(line.to_string());
-            block.payloads.push(payload);
-
-            if block.payloads.len() > 160 {
-                let block = pending.take().unwrap_or_default();
-                output.extend(
-                    block
-                        .original_lines
-                        .iter()
-                        .map(|line| log_file_safe_text(line)),
-                );
-                continue;
-            }
-
-            if block
-                .payloads
-                .last()
-                .is_some_and(|line| is_python_logging_error_block_end(line))
-            {
-                let block = pending.take().unwrap_or_default();
-                if !is_python_gbk_logging_noise(&block.payloads) {
-                    output.extend(
-                        block
-                            .original_lines
-                            .iter()
-                            .map(|line| log_file_safe_text(line)),
-                    );
-                }
-            }
-            continue;
-        }
-
-        if is_python_logging_error_block_start(&payload) {
-            pending = Some(PendingBlock {
-                original_lines: vec![line.to_string()],
-                payloads: vec![payload],
-            });
-            continue;
-        }
-
-        if is_standalone_python_gbk_encoding_error(&payload) {
-            continue;
-        }
-
-        output.push(log_file_safe_text(line));
-    }
-
-    if let Some(block) = pending {
-        if !is_python_gbk_logging_noise(&block.payloads) {
-            output.extend(
-                block
-                    .original_lines
-                    .iter()
-                    .map(|line| log_file_safe_text(line)),
-            );
-        }
-    }
-
-    let mut sanitized = output.join("\n");
-    if content.ends_with('\n') && !sanitized.is_empty() {
-        sanitized.push('\n');
-    }
-    sanitized
-}
-
-fn log_file_safe_text(input: &str) -> String {
-    if !contains_terminal_sensitive_char(input) {
-        return input.to_string();
-    }
-
-    let mut output = String::with_capacity(input.len());
-    for ch in input.chars() {
-        if is_terminal_sensitive_char(ch) {
-            output.push_str(&format!("\\u{{{:X}}}", ch as u32));
-        } else {
-            output.push(ch);
-        }
-    }
-    output
-}
-
-fn contains_terminal_sensitive_char(input: &str) -> bool {
-    input.chars().any(is_terminal_sensitive_char)
-}
-
-fn is_terminal_sensitive_char(ch: char) -> bool {
-    let code = ch as u32;
-    code == 0xFE0E
-        || code == 0xFE0F
-        || (0x2600..=0x27BF).contains(&code)
-        || (0x1F000..=0x1FAFF).contains(&code)
-}
-
-fn persisted_log_payload(line: &str) -> &str {
-    let Some(first_end) = line.find("] ") else {
-        return line;
-    };
-    let after_timestamp = &line[first_end + 2..];
-    let Some(second_end) = after_timestamp.find("] ") else {
-        return line;
-    };
-    &after_timestamp[second_end + 2..]
-}
-
 fn rotate_persisted_log_if_needed(
     path: &Path,
     max_bytes: u64,
@@ -2646,11 +2856,7 @@ fn rotate_persisted_log_if_needed(
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S-%9f");
     let rotated = parent.join(format!("core-{timestamp}.log"));
     fs::rename(path, &rotated).map_err(|error| {
-        format!(
-            "轮转 GSDesk 日志失败 {} -> {}: {error}",
-            path.display(),
-            rotated.display()
-        )
+        format!("轮转 GSDesk 日志失败 {} -> {}: {error}", path.display(), rotated.display())
     })?;
     prune_rotated_logs(parent, keep_files)
 }
@@ -2669,9 +2875,7 @@ fn prune_rotated_logs(log_dir: &Path, keep_files: usize) -> Result<(), String> {
                     .unwrap_or(false)
         })
         .filter_map(|path| {
-            let modified = fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .ok()?;
+            let modified = fs::metadata(&path).and_then(|metadata| metadata.modified()).ok()?;
             Some((path, modified))
         })
         .collect::<Vec<_>>();
@@ -2682,366 +2886,6 @@ fn prune_rotated_logs(log_dir: &Path, keep_files: usize) -> Result<(), String> {
         let _ = fs::remove_file(path);
     }
     Ok(())
-}
-
-fn is_python_logging_error_block_start(line: &str) -> bool {
-    line.trim() == "--- Logging error ---"
-}
-
-fn is_python_logging_error_block_end(line: &str) -> bool {
-    line.trim_start().starts_with("Arguments:")
-}
-
-fn is_standalone_python_gbk_encoding_error(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    lower.contains("unicodeencodeerror")
-        && lower.contains("'gbk'")
-        && lower.contains("can't encode character")
-        && lower.contains("illegal multibyte sequence")
-}
-
-fn is_python_gbk_logging_noise(block: &[String]) -> bool {
-    if block.is_empty() {
-        return false;
-    }
-    let joined = block.join("\n").to_lowercase();
-    is_standalone_python_gbk_encoding_error(&joined)
-        && (joined.contains("logging\\__init__.py")
-            || joined.contains("logging/__init__.py")
-            || joined.contains("colorama\\ansitowin32.py")
-            || joined.contains("colorama/ansitowin32.py"))
-}
-
-fn classify_level(line: &str) -> &str {
-    let lower = line.to_lowercase();
-    if lower.contains("[error")
-        || lower.contains("traceback")
-        || lower.starts_with("file \"")
-        || lower.contains("error")
-        || lower.contains("失败")
-        || lower.contains("exception")
-        || lower.contains("panic")
-    {
-        "error"
-    } else if lower.contains("[warn") || lower.contains("warn") || lower.contains("警告") {
-        "warn"
-    } else if lower.contains("[success")
-        || lower.contains("success")
-        || lower.contains("完成")
-        || lower.contains("已启动")
-    {
-        "success"
-    } else {
-        "info"
-    }
-}
-
-fn should_promote_recent_error(line: &str) -> bool {
-    let trimmed = line.trim();
-    let lower = trimmed.to_lowercase();
-    if is_standalone_python_gbk_encoding_error(trimmed) {
-        return false;
-    }
-    if lower.starts_with("traceback")
-        || lower.starts_with("file \"")
-        || lower.starts_with("return ")
-        || lower.starts_with("asyncio.")
-        || lower.starts_with("self.")
-        || lower.starts_with("super().")
-        || lower.starts_with("handle.")
-    {
-        return false;
-    }
-
-    lower.contains("[error")
-        || lower.contains("error")
-        || lower.contains("exception")
-        || lower.contains("failed")
-        || lower.contains("panic")
-        || lower.contains("失败")
-}
-
-#[derive(Debug, Deserialize)]
-struct RawCoreJsonLog {
-    event: Value,
-    level: Option<String>,
-    timestamp: Option<String>,
-    module: Option<String>,
-    logger: Option<String>,
-    name: Option<String>,
-    target: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CoreFileLogRecord {
-    message: String,
-    level: String,
-    timestamp: String,
-    module: Option<String>,
-    raw: Option<String>,
-}
-
-impl CoreFileLogRecord {
-    fn to_display_line(&self) -> String {
-        format!(
-            "{} [{:<8}] {}",
-            self.timestamp,
-            self.level,
-            self.message.trim()
-        )
-    }
-}
-
-fn read_core_jsonl_records(
-    path: &Path,
-    offset: u64,
-) -> Result<(Vec<CoreFileLogRecord>, u64), String> {
-    let mut file = File::open(path)
-        .map_err(|error| format!("打开 Core 日志文件失败 {}: {error}", path.display()))?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|error| format!("定位 Core 日志文件失败 {}: {error}", path.display()))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|error| format!("读取 Core 日志文件失败 {}: {error}", path.display()))?;
-    if bytes.is_empty() {
-        return Ok((Vec::new(), offset));
-    }
-
-    let complete_len = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map(|index| index + 1)
-        .unwrap_or(0);
-    if complete_len == 0 {
-        return Ok((Vec::new(), offset));
-    }
-
-    let usable_start = if offset > 0 {
-        bytes[..complete_len]
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .map(|index| index + 1)
-            .unwrap_or(complete_len)
-    } else {
-        0
-    };
-    if usable_start >= complete_len {
-        return Ok((Vec::new(), offset + complete_len as u64));
-    }
-
-    let text = String::from_utf8_lossy(&bytes[usable_start..complete_len]);
-    let mut records = Vec::new();
-    for line in text.lines() {
-        records.extend(parse_core_jsonl_line(line));
-    }
-    Ok((records, offset + complete_len as u64))
-}
-
-fn parse_core_jsonl_line(line: &str) -> Vec<CoreFileLogRecord> {
-    let raw_line = line.trim();
-    let raw = match serde_json::from_str::<RawCoreJsonLog>(line) {
-        Ok(raw) => raw,
-        Err(error) => {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return Vec::new();
-            }
-            return vec![CoreFileLogRecord {
-                message: format!("JSONL parse_error: {error}; raw={trimmed}"),
-                level: "warn".to_string(),
-                timestamp: Utc::now().format("%m-%d %H:%M:%S").to_string(),
-                module: Some("parse_error".to_string()),
-                raw: Some(trimmed.to_string()),
-            }];
-        }
-    };
-    let event = match raw.event {
-        Value::String(value) => value,
-        value => value.to_string(),
-    };
-    let timestamp = raw
-        .timestamp
-        .unwrap_or_else(|| Utc::now().format("%m-%d %H:%M:%S").to_string());
-    let level = normalize_core_json_level(raw.level.as_deref(), &event);
-    let explicit_module = raw.module.or(raw.logger).or(raw.name).or(raw.target);
-
-    event
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| CoreFileLogRecord {
-            message: line.to_string(),
-            level: level.clone(),
-            timestamp: timestamp.clone(),
-            module: explicit_module
-                .clone()
-                .or_else(|| extract_bracket_module(line)),
-            raw: Some(raw_line.to_string()),
-        })
-        .collect()
-}
-
-fn extract_bracket_module(line: &str) -> Option<String> {
-    let start = line.find('[')?;
-    let end = line[start + 1..].find(']')? + start + 1;
-    let module = line[start + 1..end].trim();
-    if module.is_empty() || module.len() > 48 || module.chars().all(|ch| ch.is_ascii_digit()) {
-        return None;
-    }
-    Some(module.to_string())
-}
-
-fn normalize_core_json_level(level: Option<&str>, event: &str) -> String {
-    match level.map(|value| value.to_lowercase()) {
-        Some(value) if value == "success" => "success".to_string(),
-        Some(value) if value == "warn" || value == "warning" => "warn".to_string(),
-        Some(value) if value == "error" || value == "exception" || value == "critical" => {
-            "error".to_string()
-        }
-        Some(value) if value == "info" => "info".to_string(),
-        _ => classify_level(event).to_string(),
-    }
-}
-
-fn normalize_log_records(text: &str) -> Vec<String> {
-    let cleaned = strip_terminal_sequences(text);
-    let mut records = Vec::new();
-    for fragment in cleaned.split(|ch| ch == '\r' || ch == '\n') {
-        let fragment = fragment.trim();
-        if fragment.is_empty() {
-            continue;
-        }
-        records.extend(split_structured_log_records(fragment));
-    }
-    records
-}
-
-fn split_structured_log_records(line: &str) -> Vec<String> {
-    let bytes = line.as_bytes();
-    let starts: Vec<usize> = (0..bytes.len())
-        .filter(|index| is_structured_log_prefix_at(bytes, *index))
-        .collect();
-
-    if starts.is_empty() {
-        return vec![line.to_string()];
-    }
-
-    let mut records = Vec::new();
-    if starts[0] > 0 {
-        let prefix = line[..starts[0]].trim();
-        if !prefix.is_empty() {
-            records.push(prefix.to_string());
-        }
-    }
-
-    for (position, start) in starts.iter().enumerate() {
-        let end = starts.get(position + 1).copied().unwrap_or(line.len());
-        let record = line[*start..end].trim();
-        if !record.is_empty() {
-            records.push(record.to_string());
-        }
-    }
-    records
-}
-
-fn is_structured_log_prefix_at(bytes: &[u8], start: usize) -> bool {
-    if bytes.len() < start + 17 {
-        return false;
-    }
-
-    let fixed = [
-        (0, b'd'),
-        (1, b'd'),
-        (2, b'-'),
-        (3, b'd'),
-        (4, b'd'),
-        (5, b' '),
-        (6, b'd'),
-        (7, b'd'),
-        (8, b':'),
-        (9, b'd'),
-        (10, b'd'),
-        (11, b':'),
-        (12, b'd'),
-        (13, b'd'),
-        (14, b' '),
-        (15, b'['),
-    ];
-
-    for (offset, expected) in fixed {
-        let actual = bytes[start + offset];
-        if expected == b'd' {
-            if !actual.is_ascii_digit() {
-                return false;
-            }
-        } else if actual != expected {
-            return false;
-        }
-    }
-
-    let mut index = start + 16;
-    while index < bytes.len() && index < start + 34 {
-        let byte = bytes[index];
-        if byte == b']' {
-            return index > start + 16;
-        }
-        if !(byte.is_ascii_alphabetic() || byte == b' ' || byte == b'_' || byte == b'-') {
-            return false;
-        }
-        index += 1;
-    }
-    false
-}
-
-fn strip_terminal_sequences(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            0x1b if index + 1 < bytes.len() && bytes[index + 1] == b'[' => {
-                index += 2;
-                while index < bytes.len() {
-                    let byte = bytes[index];
-                    index += 1;
-                    if (0x40..=0x7e).contains(&byte) {
-                        break;
-                    }
-                }
-            }
-            0x1b if index + 1 < bytes.len() && bytes[index + 1] == b']' => {
-                index += 2;
-                while index < bytes.len() {
-                    if bytes[index] == 0x07 {
-                        index += 1;
-                        break;
-                    }
-                    if bytes[index] == 0x1b && index + 1 < bytes.len() && bytes[index + 1] == b'\\'
-                    {
-                        index += 2;
-                        break;
-                    }
-                    index += 1;
-                }
-            }
-            0x08 => {
-                output.pop();
-                index += 1;
-            }
-            0x00..=0x08 | 0x0b | 0x0c | 0x0e..=0x1f | 0x7f => {
-                index += 1;
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
-        }
-    }
-
-    String::from_utf8_lossy(&output).to_string()
 }
 
 fn webconsole_available(base_url: &str) -> bool {
@@ -3055,27 +2899,38 @@ fn webconsole_available(base_url: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn wait_for_webconsole(
-    runtime: &SharedRuntime,
-    base_url: &str,
-    timeout: Duration,
-) -> Result<bool, String> {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if task_cancel_requested(runtime) {
-            return Err("任务已取消: 启动 Core".to_string());
-        }
-        if webconsole_available(base_url) {
-            return Ok(true);
-        }
-        std::thread::sleep(Duration::from_millis(700));
-    }
-    Ok(false)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+
     use super::*;
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let stamp = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        std::env::temp_dir().join(format!("gsdesk-{name}-{stamp}"))
+    }
+
+    fn test_paths(runtime: &Path) -> AppPaths {
+        AppPaths {
+            app_data: runtime.join("app").to_string_lossy().to_string(),
+            runtime: runtime.to_string_lossy().to_string(),
+            tools_dir: runtime.join("tools").to_string_lossy().to_string(),
+            core_dir: runtime.join("core").join("gsuid_core").to_string_lossy().to_string(),
+            venv_dir: runtime.join("venv").to_string_lossy().to_string(),
+            uv_cache_dir: runtime.join("cache").to_string_lossy().to_string(),
+            uv_python_dir: runtime.join("py").to_string_lossy().to_string(),
+            uv_executable: runtime
+                .join("tools")
+                .join("uv")
+                .join("uv")
+                .to_string_lossy()
+                .to_string(),
+            logs_dir: runtime.join("logs").to_string_lossy().to_string(),
+            diagnostics_dir: runtime.join("diagnostics").to_string_lossy().to_string(),
+            backups_dir: runtime.join("backups").to_string_lossy().to_string(),
+            settings_file: runtime.join("settings.json").to_string_lossy().to_string(),
+        }
+    }
 
     #[test]
     fn selects_default_port() {
@@ -3089,10 +2944,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let mut settings = Settings {
-            preferred_core_port: Some(port),
-            ..Settings::default()
-        };
+        let mut settings = Settings { preferred_core_port: Some(port), ..Settings::default() };
 
         assert_eq!(resolve_start_port(&settings, None).unwrap(), port);
         settings.preferred_core_port = None;
@@ -3103,10 +2955,7 @@ mod tests {
     fn resolve_start_port_rejects_occupied_fixed_port() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
-        let settings = Settings {
-            preferred_core_port: Some(port),
-            ..Settings::default()
-        };
+        let settings = Settings { preferred_core_port: Some(port), ..Settings::default() };
 
         let error = resolve_start_port(&settings, None).unwrap_err();
         assert!(error.contains("固定端口"));
@@ -3115,9 +2964,154 @@ mod tests {
 
     #[test]
     fn selected_source_follows_mode() {
-        let mut settings = Settings::default();
-        settings.source_mode = "cnb".to_string();
+        let settings = Settings { source_mode: "cnb".to_string(), ..Settings::default() };
         assert!(selected_source(&settings).contains("cnb.cool"));
+    }
+
+    #[test]
+    fn parses_core_repo_changes_from_porcelain_status() {
+        let change = parse_core_repo_change(" M uv.lock").unwrap();
+
+        assert_eq!(change.status, "M");
+        assert_eq!(change.path, "uv.lock");
+
+        let renamed = parse_core_repo_change("R  old.py -> new.py").unwrap();
+        assert_eq!(renamed.status, "R");
+        assert_eq!(renamed.path, "new.py");
+    }
+
+    #[test]
+    fn cleanable_core_update_paths_are_limited() {
+        assert!(cleanable_core_update_path("uv.lock"));
+        assert!(!cleanable_core_update_path("pyproject.toml"));
+        assert!(!cleanable_core_update_path("gsuid_core/plugins/user.py"));
+    }
+
+    #[test]
+    fn parses_core_commit_entry_with_current_and_rollback_marks() {
+        let current = "abc1234567890abcdef1234567890abcdef1234";
+        let line = "abc1234567890abcdef1234567890abcdef1234\x1fabc1234\x1f2026-06-20T12:00:00+08:00\x1fdev\x1f修复启动流程";
+
+        let entry = parse_core_commit_entry(line, current, Some("abc1234")).unwrap();
+
+        assert_eq!(entry.short_commit, "abc1234");
+        assert_eq!(entry.subject, "修复启动流程");
+        assert!(entry.is_current);
+        assert!(entry.is_rollback);
+    }
+
+    #[test]
+    fn core_source_state_accepts_existing_source_tree() {
+        let core_dir = unique_test_dir("source-tree");
+        fs::create_dir_all(&core_dir).unwrap();
+        fs::write(core_dir.join("pyproject.toml"), "[project]\nname = \"gsuid_core\"\n").unwrap();
+
+        assert_eq!(core_source_state(&core_dir), CoreSourceState::SourceTree);
+
+        let _ = fs::remove_dir_all(core_dir);
+    }
+
+    #[test]
+    fn core_source_state_rejects_existing_invalid_directory() {
+        let core_dir = unique_test_dir("invalid-core");
+        fs::create_dir_all(&core_dir).unwrap();
+
+        let state = core_source_state(&core_dir);
+
+        assert!(
+            matches!(state, CoreSourceState::Invalid(message) if message.contains("pyproject.toml"))
+        );
+
+        let _ = fs::remove_dir_all(core_dir);
+    }
+
+    #[test]
+    fn reclone_backup_dir_keeps_managed_core_backup_under_runtime() {
+        let runtime = unique_test_dir("managed-backup");
+        let paths = test_paths(&runtime);
+        let core_dir = runtime.join("core").join("gsuid_core");
+
+        let backup_dir = reclone_backup_dir(&paths, &core_dir).unwrap();
+
+        assert!(backup_dir.starts_with(runtime.join("backups")));
+        assert!(backup_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("gsuid_core-")));
+    }
+
+    #[test]
+    fn reclone_backup_dir_keeps_custom_core_backup_as_sibling() {
+        let runtime = unique_test_dir("custom-backup-runtime");
+        let custom_parent = unique_test_dir("custom-core-parent");
+        let paths = test_paths(&runtime);
+        let core_dir = custom_parent.join("custom-core");
+
+        let backup_dir = reclone_backup_dir(&paths, &core_dir).unwrap();
+
+        assert!(backup_dir.starts_with(&custom_parent));
+        assert!(backup_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("custom-core-backup-")));
+    }
+
+    #[test]
+    fn service_id_guard_keeps_nonebot2_as_unconfigured_service() {
+        assert!(ensure_gsuid_service(None).is_ok());
+        assert!(ensure_gsuid_service(Some(GSUID_SERVICE_ID)).is_ok());
+
+        let error = ensure_gsuid_service(Some(NONEBOT_SERVICE_ID)).unwrap_err();
+
+        assert!(error.contains("NoneBot2 暂未配置"));
+        assert!(!error.contains("v1"));
+    }
+
+    #[test]
+    fn attach_runtime_to_persisted_core_restores_detached_state() {
+        let started_at = "2026-06-20T12:00:00+08:00".to_string();
+        let record = PersistedCoreProcess { pid: 42, port: 8765, started_at: started_at.clone() };
+        let mut runtime = ServiceRuntime {
+            status: ServiceStatus::Stopped,
+            recent_error: Some("旧错误".to_string()),
+            webconsole_available: true,
+            next_webconsole_probe_at: Some(Instant::now()),
+            ..ServiceRuntime::default()
+        };
+
+        assert!(attach_runtime_to_persisted_core(&mut runtime, &record));
+        assert_eq!(runtime.status, ServiceStatus::Running);
+        assert_eq!(runtime.port, Some(8765));
+        assert_eq!(runtime.started_at, Some(started_at));
+        assert!(runtime.recent_error.is_none());
+        assert!(!runtime.webconsole_available);
+        assert!(runtime.next_webconsole_probe_at.is_none());
+        assert!(!attach_runtime_to_persisted_core(&mut runtime, &record));
+    }
+
+    #[test]
+    fn snapshot_restores_alive_persisted_core_process() {
+        let runtime_dir = unique_test_dir("persisted-core-process");
+        let paths = test_paths(&runtime_dir);
+        let started_at = "2026-06-20T12:00:00+08:00";
+        let pid = std::process::id();
+        persist_core_process(&paths, pid, 18765, started_at).unwrap();
+
+        let mut runtime = ServiceRuntime::default();
+        let snapshot = snapshot(&mut runtime, &paths, None)
+            .into_iter()
+            .find(|service| service.service_id == GSUID_SERVICE_ID)
+            .unwrap();
+
+        assert_eq!(snapshot.status, ServiceStatus::Running);
+        assert_eq!(snapshot.pid, Some(pid));
+        assert_eq!(snapshot.port, Some(18765));
+        assert_eq!(snapshot.url, Some("http://127.0.0.1:18765".to_string()));
+        assert_eq!(snapshot.started_at, Some(started_at.to_string()));
+        assert_eq!(runtime.status, ServiceStatus::Running);
+        assert_eq!(runtime.port, Some(18765));
+
+        let _ = fs::remove_dir_all(runtime_dir);
     }
 
     #[test]
@@ -3131,16 +3125,16 @@ mod tests {
             venv_dir: "v".into(),
             uv_cache_dir: "cache".into(),
             uv_python_dir: "py".into(),
-            uv_executable: "tools/uv/uv".into(),
+            uv_executable: "tools/uv/Scripts/uv.exe".into(),
             logs_dir: "l".into(),
             diagnostics_dir: "d".into(),
             backups_dir: "b".into(),
             settings_file: "s".into(),
         };
         let envs = runtime_env(&settings, &paths);
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "UV_PROJECT_ENVIRONMENT" && value == "v"));
+        assert!(envs.iter().any(|(key, value)| key == "UV_PROJECT_ENVIRONMENT" && value == "v"));
+        assert!(envs.iter().any(|(key, value)| key == "UV_PYTHON_DOWNLOADS" && value == "never"));
+        assert!(envs.iter().any(|(key, value)| key == "GIT_TERMINAL_PROMPT" && value == "0"));
     }
 
     #[test]
@@ -3154,7 +3148,7 @@ mod tests {
             venv_dir: "v".into(),
             uv_cache_dir: "cache".into(),
             uv_python_dir: "py".into(),
-            uv_executable: "tools/uv/uv".into(),
+            uv_executable: "tools/uv/Scripts/uv.exe".into(),
             logs_dir: "l".into(),
             diagnostics_dir: "d".into(),
             backups_dir: "b".into(),
@@ -3162,45 +3156,24 @@ mod tests {
         };
         let envs = runtime_env(&settings, &paths);
 
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "PYTHONUTF8" && value == "1"));
+        assert!(envs.iter().any(|(key, value)| key == "PYTHONUTF8" && value == "1"));
         assert!(envs
             .iter()
             .any(|(key, value)| key == "PYTHONIOENCODING" && value == PYTHON_IO_ENCODING));
-        assert!(!envs
-            .iter()
-            .any(|(key, _)| key == LEGACY_WINDOWS_STDIO_ENV));
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "PYTHONUNBUFFERED" && value == "1"));
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "UV_NO_PROGRESS" && value == "1"));
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "NO_COLOR" && value == "1"));
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "FORCE_COLOR" && value == "0"));
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "CLICOLOR" && value == "0"));
-        assert!(envs
-            .iter()
-            .any(|(key, value)| key == "TERM" && value == "dumb"));
+        assert!(!envs.iter().any(|(key, _)| key == LEGACY_WINDOWS_STDIO_ENV));
+        assert!(envs.iter().any(|(key, value)| key == "PYTHONUNBUFFERED" && value == "1"));
+        assert!(envs.iter().any(|(key, value)| key == "UV_NO_PROGRESS" && value == "1"));
+        assert!(envs.iter().any(|(key, value)| key == "GIT_OPTIONAL_LOCKS" && value == "0"));
+        assert!(envs.iter().any(|(key, value)| key == "NO_COLOR" && value == "1"));
+        assert!(envs.iter().any(|(key, value)| key == "FORCE_COLOR" && value == "0"));
+        assert!(envs.iter().any(|(key, value)| key == "CLICOLOR" && value == "0"));
+        assert!(envs.iter().any(|(key, value)| key == "TERM" && value == "dumb"));
     }
 
     #[test]
     fn stop_commands_try_graceful_before_force() {
-        assert_eq!(
-            windows_taskkill_args(1234, false),
-            vec!["/PID", "1234", "/T"]
-        );
-        assert_eq!(
-            windows_taskkill_args(1234, true),
-            vec!["/PID", "1234", "/T", "/F"]
-        );
+        assert_eq!(windows_taskkill_args(1234, false), vec!["/PID", "1234", "/T"]);
+        assert_eq!(windows_taskkill_args(1234, true), vec!["/PID", "1234", "/T", "/F"]);
         assert_eq!(
             unix_tree_signal_script(1234, "TERM"),
             "pkill -TERM -P 1234 >/dev/null 2>&1 || true; kill -TERM 1234 >/dev/null 2>&1 || true"
@@ -3225,6 +3198,45 @@ mod tests {
                 "06-19 10:37:45 [info     ] third",
             ]
         );
+    }
+
+    #[test]
+    fn suppresses_duplicate_core_console_after_file_log_ready() {
+        let mut runtime = ServiceRuntime { core_file_log_ready: true, ..ServiceRuntime::default() };
+
+        assert!(should_suppress_console_record(
+            &runtime,
+            "stdout",
+            "06-19 10:37:47 [info     ] WebConsole挂载成功"
+        ));
+        assert!(should_suppress_console_record(
+            &runtime,
+            "stdout",
+            "Started server process [36928]"
+        ));
+        assert!(!should_suppress_console_record(
+            &runtime,
+            "stderr",
+            "Traceback (most recent call last):"
+        ));
+
+        runtime.core_file_log_ready = false;
+        assert!(!should_suppress_console_record(
+            &runtime,
+            "stdout",
+            "06-19 10:37:47 [info     ] WebConsole挂载成功"
+        ));
+    }
+
+    #[test]
+    fn suppresses_standalone_gbk_encoding_noise_before_file_log_ready() {
+        let runtime = ServiceRuntime::default();
+
+        assert!(should_suppress_console_record(
+            &runtime,
+            "stderr",
+            "UnicodeEncodeError: 'gbk' codec can't encode character '\\U0001f5d1' in position 0: illegal multibyte sequence"
+        ));
     }
 
     #[test]
@@ -3289,18 +3301,15 @@ mod tests {
 
     #[test]
     fn task_cancel_error_marks_task_cancelled_and_next_task_clears_flag() {
-        let mut runtime = ServiceRuntime::default();
-        runtime.cancel_requested = true;
-        runtime.status = ServiceStatus::Initializing;
+        let mut runtime = ServiceRuntime {
+            cancel_requested: true,
+            status: ServiceStatus::Initializing,
+            ..ServiceRuntime::default()
+        };
         let first = start_task(&mut runtime, "初始化运行时", "python", "安装 Python");
         runtime.cancel_requested = true;
 
-        finish_task_for_error(
-            &mut runtime,
-            first,
-            "python",
-            "任务已取消: uv python install 3.12",
-        );
+        finish_task_for_error(&mut runtime, first, "python", "任务已取消: uv python install 3.12");
 
         let task = runtime.tasks.iter().find(|task| task.id == first).unwrap();
         assert_eq!(task.status, "cancelled");
@@ -3310,15 +3319,7 @@ mod tests {
 
         let second = start_task(&mut runtime, "启动 Core", "spawn", "正在启动");
         assert!(!runtime.cancel_requested);
-        assert_eq!(
-            runtime
-                .tasks
-                .iter()
-                .find(|task| task.id == second)
-                .unwrap()
-                .status,
-            "running"
-        );
+        assert_eq!(runtime.tasks.iter().find(|task| task.id == second).unwrap().status, "running");
     }
 
     #[test]
@@ -3401,327 +3402,16 @@ mod tests {
 
     #[test]
     fn classifies_traceback_lines_as_errors() {
-        assert_eq!(
-            classify_level("Traceback (most recent call last):"),
-            "error"
-        );
-        assert_eq!(
-            classify_level("File \"core.py\", line 79, in main"),
-            "error"
-        );
-        assert_eq!(
-            classify_level("06-19 10:37:47 [success  ] started"),
-            "success"
-        );
+        assert_eq!(classify_level("Traceback (most recent call last):"), "error");
+        assert_eq!(classify_level("File \"core.py\", line 79, in main"), "error");
+        assert_eq!(classify_level("06-19 10:37:47 [success  ] started"), "info");
     }
 
     #[test]
     fn promotes_only_actionable_recent_errors() {
-        assert!(!should_promote_recent_error(
-            "File \"core.py\", line 79, in main"
-        ));
-        assert!(!should_promote_recent_error(
-            "Traceback (most recent call last):"
-        ));
-        assert!(should_promote_recent_error(
-            "ModuleNotFoundError: No module named 'gsuid_core'"
-        ));
-        assert!(should_promote_recent_error(
-            "06-19 10:37:45 [error    ] 启动失败"
-        ));
-    }
-
-    #[test]
-    fn parses_core_jsonl_log_lines() {
-        let records = parse_core_jsonl_line(
-            r#"{"event":"Started server process [36928]\nWaiting for application startup.","level":"info","timestamp":"06-19 10:37:47"}"#,
-        );
-
-        assert_eq!(
-            records,
-            vec![
-                CoreFileLogRecord {
-                    message: "Started server process [36928]".to_string(),
-                    level: "info".to_string(),
-                    timestamp: "06-19 10:37:47".to_string(),
-                    module: None,
-                    raw: Some(
-                        r#"{"event":"Started server process [36928]\nWaiting for application startup.","level":"info","timestamp":"06-19 10:37:47"}"#
-                            .to_string(),
-                    ),
-                },
-                CoreFileLogRecord {
-                    message: "Waiting for application startup.".to_string(),
-                    level: "info".to_string(),
-                    timestamp: "06-19 10:37:47".to_string(),
-                    module: None,
-                    raw: Some(
-                        r#"{"event":"Started server process [36928]\nWaiting for application startup.","level":"info","timestamp":"06-19 10:37:47"}"#
-                            .to_string(),
-                    ),
-                },
-            ]
-        );
-        assert_eq!(
-            records[0].to_display_line(),
-            "06-19 10:37:47 [info    ] Started server process [36928]"
-        );
-    }
-
-    #[test]
-    fn keeps_core_jsonl_parse_errors_visible() {
-        let records = parse_core_jsonl_line("{bad json");
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].level, "warn");
-        assert!(records[0].message.contains("JSONL parse_error"));
-        assert!(records[0].message.contains("{bad json"));
-        assert_eq!(records[0].module.as_deref(), Some("parse_error"));
-    }
-
-    #[test]
-    fn reads_core_jsonl_incrementally() {
-        let dir = std::env::temp_dir().join(format!(
-            "gsdesk-jsonl-test-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("2026-06-19.log");
-        fs::write(
-            &path,
-            "{\"event\":\"first\",\"level\":\"info\",\"timestamp\":\"06-19 10:37:43\"}\n{\"event\":\"second\",\"level\":\"success\",\"timestamp\":\"06-19 10:37:44\"}\n",
-        )
-        .unwrap();
-
-        let (records, offset) = read_core_jsonl_records(&path, 0).unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[1].level, "success");
-
-        fs::write(
-            &path,
-            "{\"event\":\"first\",\"level\":\"info\",\"timestamp\":\"06-19 10:37:43\"}\n{\"event\":\"second\",\"level\":\"success\",\"timestamp\":\"06-19 10:37:44\"}\n{\"event\":\"partial\",\"level\":\"info\"",
-        )
-        .unwrap();
-        let (records, next_offset) = read_core_jsonl_records(&path, offset).unwrap();
-        assert!(records.is_empty());
-        assert_eq!(next_offset, offset);
-
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn reads_core_jsonl_from_middle_without_partial_line_noise() {
-        let dir = std::env::temp_dir().join(format!(
-            "gsdesk-jsonl-tail-test-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("2026-06-19.log");
-        let content = concat!(
-            "{\"event\":\"first long line\",\"level\":\"info\",\"timestamp\":\"06-19 10:37:43\"}\n",
-            "{\"event\":\"second\",\"level\":\"success\",\"timestamp\":\"06-19 10:37:44\"}\n"
-        );
-        fs::write(&path, content).unwrap();
-
-        let offset_inside_first_line = 10;
-        let (records, next_offset) =
-            read_core_jsonl_records(&path, offset_inside_first_line).unwrap();
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].message, "second");
-        assert_eq!(records[0].level, "success");
-        assert_eq!(next_offset, content.len() as u64);
-
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn runtime_backup_redacts_settings_and_excludes_heavy_runtime_dirs() {
-        let dir = std::env::temp_dir().join(format!(
-            "gsdesk-backup-test-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let runtime = dir.join("runtime");
-        let core = runtime.join("core").join("gsuid_core");
-        let data = core.join("data");
-        let config = core.join("config");
-        let venv = runtime.join("venvs").join("gsuid_core");
-        let cache = runtime.join("uv").join("cache");
-        let backups = runtime.join("backups");
-        fs::create_dir_all(&data).unwrap();
-        fs::create_dir_all(&config).unwrap();
-        fs::create_dir_all(&venv).unwrap();
-        fs::create_dir_all(&cache).unwrap();
-        fs::write(
-            dir.join("settings.json"),
-            r#"{"WS_TOKEN":"abc","proxy":"http://user:pass@127.0.0.1:7890"}"#,
-        )
-        .unwrap();
-        fs::write(data.join("config.json"), "{}").unwrap();
-        fs::write(config.join("core.json"), "{}").unwrap();
-        fs::write(venv.join("pyvenv.cfg"), "venv").unwrap();
-        fs::write(cache.join("cache.bin"), "cache").unwrap();
-
-        let paths = crate::models::AppPaths {
-            app_data: dir.to_string_lossy().to_string(),
-            runtime: runtime.to_string_lossy().to_string(),
-            tools_dir: runtime.join("tools").to_string_lossy().to_string(),
-            core_dir: core.to_string_lossy().to_string(),
-            venv_dir: venv.to_string_lossy().to_string(),
-            uv_cache_dir: cache.to_string_lossy().to_string(),
-            uv_python_dir: runtime
-                .join("uv")
-                .join("python")
-                .to_string_lossy()
-                .to_string(),
-            uv_executable: runtime
-                .join("tools")
-                .join("uv")
-                .join(crate::paths::uv_executable_name())
-                .to_string_lossy()
-                .to_string(),
-            logs_dir: dir.join("logs").to_string_lossy().to_string(),
-            diagnostics_dir: dir.join("diagnostics").to_string_lossy().to_string(),
-            backups_dir: backups.to_string_lossy().to_string(),
-            settings_file: dir.join("settings.json").to_string_lossy().to_string(),
-        };
-
-        let backup = create_runtime_backup_inner(&paths).unwrap();
-        let file = File::open(&backup.path).unwrap();
-        let mut archive = zip::ZipArchive::new(file).unwrap();
-        let names = (0..archive.len())
-            .map(|index| archive.by_index(index).unwrap().name().to_string())
-            .collect::<Vec<_>>();
-        assert!(names.iter().any(|name| name == "settings.redacted.json"));
-        assert!(names.iter().any(|name| name == "core-data/config.json"));
-        assert!(names.iter().any(|name| name == "core-config/core.json"));
-        assert!(!names.iter().any(|name| name.contains("pyvenv.cfg")));
-        assert!(!names.iter().any(|name| name.contains("cache.bin")));
-
-        let mut settings = String::new();
-        archive
-            .by_name("settings.redacted.json")
-            .unwrap()
-            .read_to_string(&mut settings)
-            .unwrap();
-        assert!(!settings.contains("abc"));
-        assert!(!settings.contains("pass@"));
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn runtime_restore_replaces_allowed_runtime_dirs_and_creates_safety_backup() {
-        let dir = std::env::temp_dir().join(format!(
-            "gsdesk-restore-test-{}",
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let runtime = dir.join("runtime");
-        let core = runtime.join("core").join("gsuid_core");
-        let data = core.join("data");
-        let config = core.join("config");
-        let plugins = core.join("plugins");
-        let logs = dir.join("logs");
-        let backups = runtime.join("backups");
-        fs::create_dir_all(&data).unwrap();
-        fs::create_dir_all(&config).unwrap();
-        fs::create_dir_all(&plugins).unwrap();
-        fs::create_dir_all(&logs).unwrap();
-        fs::create_dir_all(&backups).unwrap();
-        fs::write(data.join("old.json"), "old").unwrap();
-        fs::write(config.join("old.json"), "old").unwrap();
-        fs::write(plugins.join("old.py"), "old").unwrap();
-        fs::write(logs.join("core.log"), "old").unwrap();
-
-        let backup_path = backups.join("gsdesk-runtime-restore.zip");
-        {
-            let file = File::create(&backup_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            let options =
-                FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-            add_backup_text(&mut zip, options, "core-data/new.json", "new-data").unwrap();
-            add_backup_text(&mut zip, options, "core-config/new.json", "new-config").unwrap();
-            add_backup_text(&mut zip, options, "core-plugins/new.py", "new-plugin").unwrap();
-            add_backup_text(&mut zip, options, "logs/core.log", "new-log").unwrap();
-            zip.finish().unwrap();
-        }
-
-        let paths = crate::models::AppPaths {
-            app_data: dir.to_string_lossy().to_string(),
-            runtime: runtime.to_string_lossy().to_string(),
-            tools_dir: runtime.join("tools").to_string_lossy().to_string(),
-            core_dir: core.to_string_lossy().to_string(),
-            venv_dir: runtime
-                .join("venvs")
-                .join("gsuid_core")
-                .to_string_lossy()
-                .to_string(),
-            uv_cache_dir: runtime
-                .join("uv")
-                .join("cache")
-                .to_string_lossy()
-                .to_string(),
-            uv_python_dir: runtime
-                .join("uv")
-                .join("python")
-                .to_string_lossy()
-                .to_string(),
-            uv_executable: runtime
-                .join("tools")
-                .join("uv")
-                .join(crate::paths::uv_executable_name())
-                .to_string_lossy()
-                .to_string(),
-            logs_dir: logs.to_string_lossy().to_string(),
-            diagnostics_dir: dir.join("diagnostics").to_string_lossy().to_string(),
-            backups_dir: backups.to_string_lossy().to_string(),
-            settings_file: dir.join("settings.json").to_string_lossy().to_string(),
-        };
-
-        let restored =
-            restore_runtime_backup_inner(&paths, Some(backup_path.to_string_lossy().as_ref()))
-                .unwrap();
-
-        assert!(restored.safety_backup.is_some());
-        assert!(restored.restored.contains(&"core-data".to_string()));
-        assert_eq!(
-            fs::read_to_string(data.join("new.json")).unwrap(),
-            "new-data"
-        );
-        assert!(!data.join("old.json").exists());
-        assert_eq!(
-            fs::read_to_string(config.join("new.json")).unwrap(),
-            "new-config"
-        );
-        assert_eq!(
-            fs::read_to_string(plugins.join("new.py")).unwrap(),
-            "new-plugin"
-        );
-        assert_eq!(
-            fs::read_to_string(logs.join("core.log")).unwrap(),
-            "new-log"
-        );
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn extracts_module_from_real_core_jsonl_shape_with_emoji_event() {
-        let marker = char::from_u32(0x1f5d1).unwrap();
-        let event = format!("{marker} [ResourceManager] TTL 已清理");
-        let raw = serde_json::json!({
-            "event": event,
-            "level": "success",
-            "timestamp": "06-19 10:37:47"
-        })
-        .to_string();
-        let records = parse_core_jsonl_line(&raw);
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].message, event);
-        assert_eq!(records[0].module.as_deref(), Some("ResourceManager"));
-        assert_eq!(records[0].level, "success");
+        assert!(!should_promote_recent_error("File \"core.py\", line 79, in main"));
+        assert!(!should_promote_recent_error("Traceback (most recent call last):"));
+        assert!(should_promote_recent_error("ModuleNotFoundError: No module named 'gsuid_core'"));
+        assert!(should_promote_recent_error("06-19 10:37:45 [error    ] 启动失败"));
     }
 }

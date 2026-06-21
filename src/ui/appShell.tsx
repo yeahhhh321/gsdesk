@@ -1,96 +1,84 @@
-import { Badge, Button, Layout, Menu, Tag, Typography } from "antd";
-import type { ReactNode } from "react";
-import {
-  ExternalLink,
-  FileArchive,
-  Gauge,
-  Globe,
-  HardDrive,
-  RefreshCcw,
-  Terminal,
-} from "lucide-react";
+import { useState } from "react";
+import { Badge, Button, Layout, Menu, Tooltip, Typography } from "antd";
+import { PanelLeftClose, PanelLeftOpen, RefreshCcw } from "lucide-react";
 import type { ServiceStatus } from "../types";
+import appIconUrl from "../assets/genshinuid-icon.png";
+import { navItemsForMode, routeParentKey, sectionMeta, type AppNavGroupKey, type AppSectionKey } from "./appSections";
+import { displayText } from "./format";
+import { statusText } from "./status";
 
 const { Header, Sider } = Layout;
 const { Text, Title } = Typography;
-
-export type AppSectionKey =
-  | "overview"
-  | "webconsole"
-  | "logs"
-  | "environment"
-  | "network"
-  | "diagnostics";
-
-export const statusText: Record<ServiceStatus, string> = {
-  uninitialized: "未初始化",
-  checking: "检测中",
-  initializing: "初始化中",
-  starting: "启动中",
-  running: "运行中",
-  stopping: "停止中",
-  stopped: "已停止",
-  failed: "失败",
-  crashed: "已崩溃",
-};
-
-export const statusColor: Record<ServiceStatus, string> = {
-  uninitialized: "default",
-  checking: "processing",
-  initializing: "processing",
-  starting: "processing",
-  running: "success",
-  stopping: "warning",
-  stopped: "default",
-  failed: "error",
-  crashed: "error",
-};
-
-const sections: Array<{ key: AppSectionKey; icon: ReactNode; label: string; description: string }> = [
-  { key: "overview", icon: <Gauge size={18} />, label: "运行总控台", description: "管理 Core 状态、启动入口和首启流程" },
-  { key: "webconsole", icon: <ExternalLink size={18} />, label: "WebConsole", description: "打开 gsuid_core 自带 WebConsole" },
-  { key: "logs", icon: <Terminal size={18} />, label: "终端日志", description: "查看 Core 文件日志和启动失败原始信息" },
-  { key: "environment", icon: <HardDrive size={18} />, label: "环境与修复", description: "检查隔离目录、uv、Python 和依赖状态" },
-  { key: "network", icon: <Globe size={18} />, label: "网络与设置", description: "配置源码源、PyPI 镜像、代理和基础偏好" },
-  { key: "diagnostics", icon: <FileArchive size={18} />, label: "诊断导出", description: "导出诊断包并检查壳更新" },
-];
-
-export const sectionMeta = Object.fromEntries(sections.map((section) => [section.key, section])) as Record<
-  AppSectionKey,
-  (typeof sections)[number]
->;
-
-const navItems = sections.map(({ key, icon, label }) => ({ key, icon, label }));
 
 interface AppSidebarProps {
   activeKey: AppSectionKey;
   coreStatus: ServiceStatus;
   version?: string;
+  beginnerMode: boolean;
   onSelect: (key: AppSectionKey) => void;
 }
 
-export function AppSidebar({ activeKey, coreStatus, version, onSelect }: AppSidebarProps) {
+export function AppSidebar({ activeKey, coreStatus, version, beginnerMode, onSelect }: AppSidebarProps) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [manualOpenKeys, setManualOpenKeys] = useState<AppNavGroupKey[]>([]);
+  const toggleLabel = collapsed ? "展开侧边栏" : "收起侧边栏";
+  const statusLabel = `Core ${statusText[coreStatus]} / v${displayText(version, "0.1.0")}`;
+  const activeParentKey = routeParentKey[activeKey];
+  const openKeys = collapsed ? [] : uniqueOpenKeys(manualOpenKeys, activeParentKey);
+
   return (
-    <Sider width={236} className="sidebar">
+    <Sider width={224} collapsedWidth={72} collapsed={collapsed} trigger={null} className="sidebar">
       <div className="brand">
-        <div className="brand-mark">GS</div>
-        <div>
-          <div className="brand-name">GSDesk</div>
-          <div className="brand-subtitle">gsuid_core 桌面管家</div>
-        </div>
+        <img className="brand-mark" src={appIconUrl} alt="GSDesk" />
+        {!collapsed && (
+          <div>
+            <div className="brand-name">GSDesk</div>
+            <div className="brand-subtitle">gsuid_core 桌面管家</div>
+          </div>
+        )}
       </div>
       <Menu
         mode="inline"
+        inlineCollapsed={collapsed}
+        openKeys={openKeys}
         selectedKeys={[activeKey]}
+        onOpenChange={(keys) => setManualOpenKeys(keys.filter(isNavGroupKey))}
         onSelect={({ key }) => onSelect(key as AppSectionKey)}
-        items={navItems}
+        items={navItemsForMode(beginnerMode)}
       />
       <div className="sidebar-footer">
-        <Badge status={coreStatus === "running" ? "success" : "default"} text={statusText[coreStatus]} />
-        <Text type="secondary">v{version || "0.1.0"}</Text>
+        {collapsed ? (
+          <Tooltip title={statusLabel} placement="right">
+            <Badge status={coreStatus === "running" ? "success" : "default"} />
+          </Tooltip>
+        ) : (
+          <>
+            <Badge status={coreStatus === "running" ? "success" : "default"} text={statusText[coreStatus]} />
+            <Text type="secondary">v{displayText(version, "0.1.0")}</Text>
+          </>
+        )}
+        <Tooltip title={toggleLabel} placement="right">
+          <Button
+            size="small"
+            type="text"
+            aria-label={toggleLabel}
+            icon={collapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+            onClick={() => setCollapsed((value) => !value)}
+          />
+        </Tooltip>
       </div>
     </Sider>
   );
+}
+
+function uniqueOpenKeys(openKeys: AppNavGroupKey[], activeParentKey?: AppNavGroupKey) {
+  if (!activeParentKey) return openKeys;
+  if (openKeys.includes(activeParentKey)) return openKeys;
+  return [...openKeys, activeParentKey];
+}
+
+function isNavGroupKey(key: string): key is AppNavGroupKey {
+  return key === "network" || key === "environment" || key === "diagnostics";
 }
 
 interface AppHeaderProps {
@@ -111,8 +99,4 @@ export function AppHeader({ activeKey, onRefresh }: AppHeaderProps) {
       </Button>
     </Header>
   );
-}
-
-export function StatusTag({ status }: { status: ServiceStatus }) {
-  return <Tag color={statusColor[status]}>{statusText[status]}</Tag>;
 }

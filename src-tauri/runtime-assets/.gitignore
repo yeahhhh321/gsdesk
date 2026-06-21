@@ -1,0 +1,7 @@
+/manifest.json
+/python/*
+!/python/.gitkeep
+/uv/*
+!/uv/.gitkeep
+/git/*
+!/git/.gitkeep

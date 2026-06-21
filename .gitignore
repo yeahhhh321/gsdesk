@@ -23,6 +23,12 @@ playwright-report/
 # Rust / Tauri
 target/
 src-tauri/gen/
+.tauri/
+src-tauri/runtime-assets/manifest.json
+src-tauri/runtime-assets/python/
+src-tauri/runtime-assets/uv/
+src-tauri/runtime-assets/git/*
+!src-tauri/runtime-assets/git/.gitkeep
 
 # Local app/runtime data
 .gsdesk/

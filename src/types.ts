@@ -6,8 +6,7 @@ export type ServiceStatus =
   | "running"
   | "stopping"
   | "stopped"
-  | "failed"
-  | "crashed";
+  | "failed";
 
 export interface ProxySettings {
   httpProxy: string;
@@ -17,8 +16,10 @@ export interface ProxySettings {
 }
 
 export interface Settings {
+  beginnerMode: boolean;
   sourceMode: "auto" | "github" | "cnb";
   selectedSource: string;
+  customCoreDir: string;
   pypiIndexMode: "auto" | "manual";
   pypiIndexUrl: string;
   preferredCorePort?: number | null;
@@ -26,6 +27,7 @@ export interface Settings {
   lastMirrorCheckAt?: string;
   proxy: ProxySettings;
   closeCoreOnExit: boolean;
+  hideToTrayOnClose: boolean;
   autoCheckUpdate: boolean;
   installGuideCompleted: boolean;
   language: "zh-CN";
@@ -49,12 +51,21 @@ export interface AppPaths {
 export interface ToolchainInfo {
   uvDetected: boolean;
   uvPath?: string;
-  uvSource: "runtime" | "bundle" | "path" | "missing" | string;
+  uvSource: "runtime" | "missing" | string;
   uvVersion?: string;
   uvBootstrapSupported: boolean;
   uvBootstrapTarget: string;
   uvBootstrapUrl?: string;
+  bundledPythonAvailable: boolean;
+  bundledPythonPath?: string;
   uvError?: string;
+  gitDetected: boolean;
+  gitPath?: string;
+  gitSource: "runtime" | "bundle" | "system" | "missing" | string;
+  gitVersion?: string;
+  bundledGitAvailable: boolean;
+  bundledGitPath?: string;
+  gitError?: string;
 }
 
 export interface ServiceSnapshot {
@@ -63,6 +74,7 @@ export interface ServiceSnapshot {
   status: ServiceStatus;
   port?: number;
   pid?: number;
+  memoryBytes?: number;
   url?: string;
   startedAt?: string;
   currentCommit?: string;
@@ -72,11 +84,16 @@ export interface ServiceSnapshot {
   webconsoleAvailable: boolean;
 }
 
+export interface ProcessResourceUsage {
+  pid: number;
+  memoryBytes?: number;
+}
+
 export interface LogEntry {
   id: number;
   serviceId: string;
   stream: "core" | "stdout" | "stderr" | "system";
-  level: "info" | "success" | "warn" | "error";
+  level: "debug" | "info" | "warn" | "error";
   line: string;
   message: string;
   module?: string;
@@ -88,6 +105,7 @@ export interface AppState {
   version: string;
   settings: Settings;
   paths: AppPaths;
+  shell: ProcessResourceUsage;
   services: ServiceSnapshot[];
   recentLogs: LogEntry[];
   preflightChecks: PreflightCheck[];
@@ -115,12 +133,23 @@ export interface TaskRecord {
   elapsedMs?: number;
 }
 
+export interface CoreCommitEntry {
+  commit: string;
+  shortCommit: string;
+  subject: string;
+  author: string;
+  committedAt: string;
+  isCurrent: boolean;
+  isRollback: boolean;
+}
+
 export interface CoreUpdateResult {
-  action: "check" | "update" | "rollback" | string;
-  channel: "stable" | "latest" | "dev" | "rollback" | string;
+  action: "check" | "clean" | "list_commits" | "update" | "rollback" | string;
+  channel: "stable" | "latest" | "dev" | "rollback" | "local" | string;
   currentCommit?: string;
   targetCommit?: string;
   rollbackCommit?: string;
+  commits: CoreCommitEntry[];
   changed: boolean;
   message: string;
 }
@@ -136,45 +165,29 @@ export interface RuntimeRestoreResult {
   restored: string[];
 }
 
+export interface PortOccupant {
+  pid: number;
+  name: string;
+  path?: string;
+}
+
+export interface ClearPortResult {
+  port: number;
+  occupants: PortOccupant[];
+  killedPids: number[];
+  released: boolean;
+  message: string;
+}
+
+export interface ClearAppDataResult {
+  appData: string;
+  deleted: string[];
+  message: string;
+}
+
 export interface SettingsTransferResult {
   path: string;
   fields: string[];
-  skipped: string[];
-}
-
-export interface CoreConfigFileSummary {
-  relativePath: string;
-  label: string;
-  path: string;
-  sizeBytes: number;
-  modifiedAt?: string;
-  entryCount: number;
-  secretCount: number;
-}
-
-export interface CoreConfigEntry {
-  key: string;
-  title: string;
-  description: string;
-  value: unknown;
-  valueType: "null" | "bool" | "number" | "string" | "array" | "object" | string;
-  options: unknown[];
-  secret: boolean;
-  editable: boolean;
-}
-
-export interface CoreConfigFileContent {
-  relativePath: string;
-  path: string;
-  schema: "gsuid" | "plain" | string;
-  entries: CoreConfigEntry[];
-}
-
-export interface CoreConfigSaveResult {
-  relativePath: string;
-  path: string;
-  backupPath?: string;
-  saved: string[];
   skipped: string[];
 }
 
@@ -215,4 +228,9 @@ export interface UpdateInfo {
   prereleaseUrl?: string;
   notes?: string;
   error?: string;
+}
+
+export interface UpdateInstallResult {
+  version?: string;
+  message: string;
 }

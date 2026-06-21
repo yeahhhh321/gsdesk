@@ -1,13 +1,18 @@
-import { useEffect, useMemo } from "react";
-import { Button, Form, Input, InputNumber, Radio, Table, Tabs, Typography } from "antd";
-import type { ColumnsType } from "antd/es/table";
+import { useEffect } from "react";
+import { Alert, Button, Form, Input, InputNumber, Radio, Table, Typography } from "antd";
 import { Activity } from "lucide-react";
-import { PanelHeader, ResultTag, SectionActions } from "../ui/primitives";
+import { displayText } from "../ui/format";
+import { WidePanel } from "../ui/pageTabs";
+import { PanelHeader, SectionActions } from "../ui/primitives";
+import { isBeginnerMode } from "../ui/userMode";
+import { diagnosticColumns, mirrorColumns, sourceColumns } from "./networkTables";
 import type { AppState, MirrorCheckResult, NetworkDiagnosticResult, Settings as SettingsType, SourceProbeResult } from "../types";
 
 const { Text } = Typography;
+export type NetworkSection = "settings" | "checks";
 
 interface NetworkPageProps {
+  section: NetworkSection;
   appState: AppState;
   sourceResults: SourceProbeResult[];
   mirrorResults: MirrorCheckResult[];
@@ -20,6 +25,7 @@ interface NetworkPageProps {
 }
 
 export default function NetworkPage({
+  section,
   appState,
   sourceResults,
   mirrorResults,
@@ -30,121 +36,144 @@ export default function NetworkPage({
   onTestNetworkTargets,
   onSaveSettings,
 }: NetworkPageProps) {
-  const sourceColumns = useMemo<ColumnsType<SourceProbeResult>>(
-    () => [
-      { title: "源", dataIndex: "name", width: 160 },
-      { title: "地址", dataIndex: "url", ellipsis: true },
-      {
-        title: "状态",
-        width: 100,
-        render: (_, row) => <ResultTag ok={row.ok} />,
-      },
-      { title: "延迟", width: 100, render: (_, row) => (row.latencyMs ? `${row.latencyMs}ms` : "-") },
-      { title: "错误", dataIndex: "error", ellipsis: true },
-    ],
-    [],
-  );
+  const beginnerMode = isBeginnerMode(appState.settings);
 
-  const mirrorColumns = useMemo<ColumnsType<MirrorCheckResult>>(
-    () => [
-      { title: "镜像", dataIndex: "name", width: 140 },
-      { title: "地址", dataIndex: "url", ellipsis: true },
-      {
-        title: "状态",
-        width: 100,
-        render: (_, row) => <ResultTag ok={row.ok} />,
-      },
-      { title: "延迟", width: 100, render: (_, row) => (row.latencyMs ? `${row.latencyMs}ms` : "-") },
-      { title: "速度", width: 120, render: (_, row) => (row.speedMbps ? `${row.speedMbps.toFixed(2)} MB/s` : "-") },
-      { title: "错误", dataIndex: "error", ellipsis: true },
-    ],
-    [],
-  );
-
-  const diagnosticColumns = useMemo<ColumnsType<NetworkDiagnosticResult>>(
-    () => [
-      { title: "目标", dataIndex: "label", width: 150 },
-      { title: "地址", dataIndex: "target", ellipsis: true },
-      {
-        title: "状态",
-        width: 100,
-        render: (_, row) => <ResultTag ok={row.ok} />,
-      },
-      { title: "延迟", width: 100, render: (_, row) => (row.latencyMs ? `${row.latencyMs}ms` : "-") },
-      { title: "错误", dataIndex: "error", ellipsis: true },
-    ],
-    [],
-  );
-
-  return (
-    <section className="page-block">
-      <PanelHeader title="网络与设置" description="源码源、PyPI 镜像、代理和基础偏好统一在这里配置" />
-      <Tabs
-        items={[
-          {
-            key: "sources",
-            label: "源码源",
-            children: (
-              <>
+  if (section === "settings") {
+    if (beginnerMode) {
+      return (
+        <section className="page-grid">
+          <WidePanel>
+            <PanelHeader
+              title="网络设置"
+              description="小白模式下使用自动源、自动镜像、自动端口和 GSDesk 托管目录"
+              actions={
                 <SectionActions>
                   <Button icon={<Activity size={16} />} loading={loadingAction === "probe_sources"} onClick={onProbeSources}>
-                    探测 GitHub / CNB
+                    检查源码源
                   </Button>
-                  <Text type="secondary">上次探测：{formatTime(appState.settings.lastSourceProbeAt)}</Text>
-                </SectionActions>
-                <Table rowKey="id" columns={sourceColumns} dataSource={sourceResults} pagination={false} size="small" />
-              </>
-            ),
-          },
-          {
-            key: "mirrors",
-            label: "PyPI 镜像",
-            children: (
-              <>
-                <SectionActions>
                   <Button icon={<Activity size={16} />} loading={loadingAction === "check_mirrors"} onClick={onCheckMirrors}>
-                    测速镜像
+                    测速下载源
                   </Button>
-                  <Text type="secondary">测速结果会按可用性和速度排序 · 上次测速：{formatTime(appState.settings.lastMirrorCheckAt)}</Text>
                 </SectionActions>
-                <Table rowKey="url" columns={mirrorColumns} dataSource={mirrorResults} pagination={false} size="small" />
-              </>
-            ),
-          },
-          {
-            key: "proxy",
-            label: "代理与设置",
-            children: <SettingsForm settings={appState.settings} onSubmit={onSaveSettings} />,
-          },
-          {
-            key: "diagnostics",
-            label: "连通性诊断",
-            children: (
-              <>
-                <SectionActions>
-                  <Button icon={<Activity size={16} />} loading={loadingAction === "test_network"} onClick={onTestNetworkTargets}>
-                    测试 GitHub / CNB / PyPI / WebConsole
-                  </Button>
-                  <Text type="secondary">使用当前代理设置，定位具体失败目标</Text>
-                </SectionActions>
-                <Table rowKey="id" columns={diagnosticColumns} dataSource={networkDiagnostics} pagination={false} size="small" />
-              </>
-            ),
-          },
-        ]}
-      />
+              }
+            />
+            <Alert
+              type="info"
+              showIcon
+              className="spaced"
+              message="不用手动填地址"
+              description="GSDesk 会自动选择可用源码源、PyPI 镜像和 Core 端口。需要固定端口、代理、自定义 Core 路径或锁定镜像时，在设置页关闭小白模式。"
+            />
+            <div className="settings-summary-grid">
+              <SummaryItem label="源码源" value={sourceModeText(appState.settings.sourceMode)} detail="默认自动选择可用源" />
+              <SummaryItem label="PyPI 镜像" value={pypiModeText(appState.settings.pypiIndexMode)} detail="测速后保存可用镜像" />
+              <SummaryItem label="Core 路径" value="GSDesk 托管" detail={appState.paths.coreDir} />
+              <SummaryItem label="端口" value="自动选择" detail="默认从 8765 开始寻找可用端口" />
+            </div>
+          </WidePanel>
+        </section>
+      );
+    }
+
+    return (
+      <section className="page-grid">
+        <WidePanel>
+          <PanelHeader title="高级网络设置" description="源码、镜像、Core 路径、端口和代理集中保存" />
+          <SettingsForm settings={appState.settings} activeCoreDir={appState.paths.coreDir} onSubmit={onSaveSettings} />
+        </WidePanel>
+      </section>
+    );
+  }
+
+  return (
+    <section className="page-grid">
+      <WidePanel>
+        <PanelHeader title="网络检测" description="首装或排查时手动运行；结果只在本页显示" />
+        <SectionActions>
+          <Button icon={<Activity size={16} />} loading={loadingAction === "probe_sources"} onClick={onProbeSources}>
+            探测 GitHub / CNB
+          </Button>
+          <Button icon={<Activity size={16} />} loading={loadingAction === "check_mirrors"} onClick={onCheckMirrors}>
+            测速 PyPI
+          </Button>
+          <Button icon={<Activity size={16} />} loading={loadingAction === "test_network"} onClick={onTestNetworkTargets}>
+            连通性诊断
+          </Button>
+          <Text type="secondary">
+            源码 {formatTime(appState.settings.lastSourceProbeAt)} / 镜像 {formatTime(appState.settings.lastMirrorCheckAt)}
+          </Text>
+        </SectionActions>
+
+        {!sourceResults.length && !mirrorResults.length && !networkDiagnostics.length && (
+          <p className="muted-block">
+            当前源码策略：{sourceModeText(appState.settings.sourceMode)}；PyPI 策略：
+            {pypiModeText(appState.settings.pypiIndexMode)}。
+          </p>
+        )}
+
+        <div className="network-result-stack">
+          {sourceResults.length > 0 && (
+            <section>
+              <h5>源码源结果</h5>
+              <Table rowKey="id" columns={sourceColumns} dataSource={sourceResults} pagination={false} size="small" />
+            </section>
+          )}
+          {mirrorResults.length > 0 && (
+            <section>
+              <h5>PyPI 镜像结果</h5>
+              <Table rowKey="url" columns={mirrorColumns} dataSource={mirrorResults} pagination={false} size="small" />
+            </section>
+          )}
+          {networkDiagnostics.length > 0 && (
+            <section>
+              <h5>连通性诊断结果</h5>
+              <Table rowKey="id" columns={diagnosticColumns} dataSource={networkDiagnostics} pagination={false} size="small" />
+            </section>
+          )}
+        </div>
+      </WidePanel>
     </section>
   );
 }
 
+function SummaryItem({ label, value, detail }: { label: string; value: string; detail?: string }) {
+  return (
+    <div className="settings-summary-item">
+      <Text type="secondary">{label}</Text>
+      <strong>{value}</strong>
+      {detail && <small>{detail}</small>}
+    </div>
+  );
+}
+
 function formatTime(value?: string) {
-  if (!value) return "从未";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
+  const text = displayText(value, "");
+  if (!text) return "从未";
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) return text;
   return date.toLocaleString();
 }
 
-function SettingsForm({ settings, onSubmit }: { settings: SettingsType; onSubmit: (settings: SettingsType) => void }) {
+function sourceModeText(value: SettingsType["sourceMode"]) {
+  if (value === "github") return "固定 GitHub";
+  if (value === "cnb") return "固定 CNB";
+  return "自动选择";
+}
+
+function pypiModeText(value: SettingsType["pypiIndexMode"]) {
+  if (value === "manual") return "手动锁定";
+  return "自动选择";
+}
+
+function SettingsForm({
+  settings,
+  activeCoreDir,
+  onSubmit,
+}: {
+  settings: SettingsType;
+  activeCoreDir: string;
+  onSubmit: (settings: SettingsType) => void;
+}) {
   const [form] = Form.useForm<SettingsType>();
 
   useEffect(() => {
@@ -169,7 +198,14 @@ function SettingsForm({ settings, onSubmit }: { settings: SettingsType; onSubmit
       <Form.Item name="selectedSource" label="当前源码源">
         <Input />
       </Form.Item>
-      <Form.Item name="pypiIndexMode" label="PyPI 镜像策略" extra="自动模式会在测速后保存最快可用镜像；手动锁定会保留当前地址，只更新时间戳和测速结果。">
+      <Form.Item name="customCoreDir" label="Core 源码路径" extra={`留空使用 GSDesk 托管目录。当前生效路径：${activeCoreDir}`}>
+        <Input placeholder="例如 D:\\runtime\\gsuid_core" />
+      </Form.Item>
+      <Form.Item
+        name="pypiIndexMode"
+        label="PyPI 镜像策略"
+        extra="自动模式会在测速后保存最快可用镜像；手动锁定会保留当前地址，只更新时间戳和测速结果。"
+      >
         <Radio.Group>
           <Radio.Button value="auto">自动选择</Radio.Button>
           <Radio.Button value="manual">手动锁定</Radio.Button>
@@ -199,18 +235,6 @@ function SettingsForm({ settings, onSubmit }: { settings: SettingsType; onSubmit
           <Input />
         </Form.Item>
       </div>
-      <Form.Item name="closeCoreOnExit" label="退出 GSDesk 时关闭 Core">
-        <Radio.Group>
-          <Radio.Button value={true}>关闭</Radio.Button>
-          <Radio.Button value={false}>后台保留</Radio.Button>
-        </Radio.Group>
-      </Form.Item>
-      <Form.Item name="autoCheckUpdate" label="启动时检查壳更新">
-        <Radio.Group>
-          <Radio.Button value={true}>开启</Radio.Button>
-          <Radio.Button value={false}>关闭</Radio.Button>
-        </Radio.Group>
-      </Form.Item>
       <Button type="primary" htmlType="submit">
         保存设置
       </Button>

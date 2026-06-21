@@ -34,14 +34,16 @@ function run(command, args) {
   return new Promise((resolve, reject) => {
     console.log(`[e2e] $ ${command} ${args.join(" ")}`);
     const windowsShellCommand = process.platform === "win32" && command === pnpm;
-    const child = windowsShellCommand ? spawn(shellLine(command, args), {
-      cwd: process.cwd(),
-      stdio: "inherit",
-      shell: true,
-    }) : spawn(command, args, {
-      cwd: process.cwd(),
-      stdio: "inherit",
-    });
+    const child = windowsShellCommand
+      ? spawn(shellLine(command, args), {
+          cwd: process.cwd(),
+          stdio: "inherit",
+          shell: true,
+        })
+      : spawn(command, args, {
+          cwd: process.cwd(),
+          stdio: "inherit",
+        });
     child.on("error", reject);
     child.on("exit", (code, signal) => {
       if (code === 0) {
@@ -117,7 +119,7 @@ function* listTextFiles(root, maxFiles) {
   let count = 0;
   while (stack.length && count < maxFiles) {
     const current = stack.pop();
-    let entries = [];
+    let entries;
     try {
       entries = fs.readdirSync(current, { withFileTypes: true });
     } catch {

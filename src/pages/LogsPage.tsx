@@ -1,12 +1,24 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Input, Select, Switch, Tag, Typography } from "antd";
-import { ArrowDownToLine, ClipboardCopy, Download, FolderOpen, Search, Trash2 } from "lucide-react";
+import { Button, Dropdown, Input, Select, Switch, Tag, Typography } from "antd";
+import { ArrowDownToLine, ClipboardCopy, Download, FolderOpen, MoreHorizontal, Search, Trash2 } from "lucide-react";
+import {
+  displayLogModule,
+  filterLogs,
+  formatLogLine,
+  getLogDisplay,
+  levelLabel,
+  logModuleOptions,
+  logsAfterClear,
+  LOG_LEVEL_OPTIONS,
+  LOG_ROW_HEIGHT,
+  type LogLevelFilter,
+  virtualLogWindow,
+} from "../logModel";
+import { displayText } from "../ui/format";
 import { PanelHeader, SectionActions } from "../ui/primitives";
 import type { LogEntry } from "../types";
 
 const { Text } = Typography;
-const LOG_ROW_HEIGHT = 30;
-const LOG_OVERSCAN = 18;
 
 interface LogsPageProps {
   logs: LogEntry[];
@@ -15,44 +27,31 @@ interface LogsPageProps {
 
 export default function LogsPage({ logs, onOpenLogsDir }: LogsPageProps) {
   const [logQuery, setLogQuery] = useState("");
-  const [logLevel, setLogLevel] = useState("all");
-  const [streamFilter, setStreamFilter] = useState("all");
+  const [logLevel, setLogLevel] = useState<LogLevelFilter>("all");
   const [moduleFilter, setModuleFilter] = useState("all");
   const [followTail, setFollowTail] = useState(true);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(360);
   const [clearedBeforeId, setClearedBeforeId] = useState<number | undefined>();
+  const [busyAction, setBusyAction] = useState<"copy" | "export">();
   const viewportRef = useRef<HTMLDivElement>(null);
+  const scrollFrameRef = useRef<number | undefined>(undefined);
   const deferredQuery = useDeferredValue(logQuery);
 
-  const activeLogs = useMemo(() => {
-    if (clearedBeforeId === undefined) return logs;
-    return logs.filter((entry) => entry.id > clearedBeforeId);
-  }, [clearedBeforeId, logs]);
+  const activeLogs = useMemo(() => logsAfterClear(logs, clearedBeforeId), [clearedBeforeId, logs]);
 
-  const filteredLogs = useMemo(() => {
-    const query = deferredQuery.trim().toLowerCase();
-    return activeLogs.filter((entry) => {
-      const levelOk = logLevel === "all" || entry.level === logLevel;
-      const streamOk = streamFilter === "all" || entry.stream === streamFilter;
-      const moduleOk = moduleFilter === "all" || (entry.module || "未标记") === moduleFilter;
-      const searchable = [entry.message, entry.module, entry.raw, entry.line, entry.serviceId].filter(Boolean).join("\n").toLowerCase();
-      const queryOk = !query || searchable.includes(query);
-      return levelOk && streamOk && moduleOk && queryOk;
-    });
-  }, [activeLogs, deferredQuery, logLevel, moduleFilter, streamFilter]);
+  const filteredLogs = useMemo(
+    () => filterLogs(activeLogs, { query: deferredQuery, level: logLevel, module: moduleFilter }),
+    [activeLogs, deferredQuery, logLevel, moduleFilter],
+  );
 
-  const moduleOptions = useMemo(() => {
-    const modules = Array.from(new Set(activeLogs.map((entry) => entry.module || "未标记"))).sort((a, b) => a.localeCompare(b, "zh-CN"));
-    return [{ value: "all", label: "全部模块" }, ...modules.slice(0, 80).map((module) => ({ value: module, label: module }))];
-  }, [activeLogs]);
-
-  const totalHeight = filteredLogs.length * LOG_ROW_HEIGHT;
-  const visibleStart = Math.max(0, Math.floor(scrollTop / LOG_ROW_HEIGHT) - LOG_OVERSCAN);
-  const visibleCount = Math.ceil(viewportHeight / LOG_ROW_HEIGHT) + LOG_OVERSCAN * 2;
-  const visibleEnd = Math.min(filteredLogs.length, visibleStart + visibleCount);
+  const moduleOptions = useMemo(() => logModuleOptions(activeLogs), [activeLogs]);
+  const { totalHeight, visibleStart, visibleEnd, visibleRange } = virtualLogWindow(
+    filteredLogs.length,
+    scrollTop,
+    viewportHeight,
+  );
   const visibleLogs = filteredLogs.slice(visibleStart, visibleEnd);
-  const visibleRange = filteredLogs.length ? `${visibleStart + 1}-${visibleEnd}` : "0-0";
 
   useEffect(() => {
     const node = viewportRef.current;
@@ -60,7 +59,10 @@ export default function LogsPage({ logs, onOpenLogsDir }: LogsPageProps) {
     setViewportHeight(node.clientHeight);
     const resizeObserver = new ResizeObserver(() => setViewportHeight(node.clientHeight));
     resizeObserver.observe(node);
-    return () => resizeObserver.disconnect();
+    return () => {
+      resizeObserver.disconnect();
+      if (scrollFrameRef.current !== undefined) window.cancelAnimationFrame(scrollFrameRef.current);
+    };
   }, []);
 
   useEffect(() => {
@@ -73,12 +75,16 @@ export default function LogsPage({ logs, onOpenLogsDir }: LogsPageProps) {
   }, [filteredLogs.length, followTail]);
 
   function handleScroll() {
-    const node = viewportRef.current;
-    if (!node) return;
-    setScrollTop(node.scrollTop);
-    setViewportHeight(node.clientHeight);
-    const distanceToBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
-    setFollowTail(distanceToBottom < LOG_ROW_HEIGHT * 3);
+    if (scrollFrameRef.current !== undefined) return;
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = undefined;
+      const node = viewportRef.current;
+      if (!node) return;
+      setScrollTop(node.scrollTop);
+      setViewportHeight(node.clientHeight);
+      const distanceToBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+      setFollowTail(distanceToBottom < LOG_ROW_HEIGHT * 3);
+    });
   }
 
   function scrollToBottom() {
@@ -90,19 +96,29 @@ export default function LogsPage({ logs, onOpenLogsDir }: LogsPageProps) {
     });
   }
 
-  function copyLogs(items: LogEntry[]) {
-    return navigator.clipboard.writeText(items.map(formatLogLine).join("\n"));
+  async function copyLogs(items: LogEntry[]) {
+    setBusyAction("copy");
+    try {
+      await navigator.clipboard.writeText(await formatLogsText(items));
+    } finally {
+      setBusyAction(undefined);
+    }
   }
 
-  function exportFilteredLogs() {
-    const content = filteredLogs.map(formatLogLine).join("\n");
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = `gsdesk-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+  async function exportFilteredLogs() {
+    setBusyAction("export");
+    try {
+      const content = await formatLogsText(filteredLogs);
+      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `gsdesk-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+    } finally {
+      setBusyAction(undefined);
+    }
   }
 
   function clearView() {
@@ -111,11 +127,29 @@ export default function LogsPage({ logs, onOpenLogsDir }: LogsPageProps) {
     setScrollTop(0);
   }
 
+  function runMoreAction(key: string) {
+    if (key === "copy_all") {
+      void copyLogs(filteredLogs);
+      return;
+    }
+    if (key === "export") {
+      void exportFilteredLogs();
+      return;
+    }
+    if (key === "open_dir") {
+      onOpenLogsDir();
+      return;
+    }
+    if (key === "clear") {
+      clearView();
+    }
+  }
+
   return (
     <section className="page-block logs-page">
       <PanelHeader
-        title="终端日志"
-        description="优先读取 Core JSONL 文件日志，stdout/stderr 保留启动失败和崩溃现场"
+        title="Core JSONL 日志"
+        description="只展示 Core data/logs 下的 JSONL 文件日志；启动命令输出不混入主日志视图"
         actions={
           <SectionActions>
             <Input
@@ -126,30 +160,7 @@ export default function LogsPage({ logs, onOpenLogsDir }: LogsPageProps) {
               value={logQuery}
               onChange={(event) => setLogQuery(event.target.value)}
             />
-            <Select
-              value={logLevel}
-              className="log-filter"
-              onChange={setLogLevel}
-              options={[
-                { value: "all", label: "全部等级" },
-                { value: "info", label: "信息" },
-                { value: "success", label: "成功" },
-                { value: "warn", label: "警告" },
-                { value: "error", label: "错误" },
-              ]}
-            />
-            <Select
-              value={streamFilter}
-              className="log-filter"
-              onChange={setStreamFilter}
-              options={[
-                { value: "all", label: "全部来源" },
-                { value: "core", label: "Core文件" },
-                { value: "stdout", label: "stdout" },
-                { value: "stderr", label: "stderr" },
-                { value: "system", label: "system" },
-              ]}
-            />
+            <Select<LogLevelFilter> value={logLevel} className="log-filter" onChange={setLogLevel} options={LOG_LEVEL_OPTIONS} />
             <Select value={moduleFilter} className="log-module-filter" onChange={setModuleFilter} options={moduleOptions} />
           </SectionActions>
         }
@@ -158,31 +169,66 @@ export default function LogsPage({ logs, onOpenLogsDir }: LogsPageProps) {
       <div className="log-toolbar">
         <div className="log-meta">
           <strong>{filteredLogs.length}</strong>
-          <Text type="secondary">条匹配 · 缓存 {activeLogs.length}/{logs.length} · 可视 {visibleRange}</Text>
+          <Text type="secondary">
+            条匹配 · JSONL {activeLogs.length}/{logs.length} · 可视 {visibleRange}
+          </Text>
         </div>
         <SectionActions>
           <span className="log-follow">
             <Text type="secondary">自动跟随</Text>
-            <Switch size="small" checked={followTail} onChange={(checked) => (checked ? scrollToBottom() : setFollowTail(false))} />
+            <Switch
+              size="small"
+              checked={followTail}
+              onChange={(checked) => (checked ? scrollToBottom() : setFollowTail(false))}
+            />
           </span>
           <Button icon={<ArrowDownToLine size={15} />} onClick={scrollToBottom}>
             到底部
           </Button>
-          <Button icon={<ClipboardCopy size={15} />} onClick={() => copyLogs(visibleLogs)} disabled={!visibleLogs.length}>
+          <Button
+            icon={<ClipboardCopy size={15} />}
+            loading={busyAction === "copy"}
+            onClick={() => void copyLogs(visibleLogs)}
+            disabled={!visibleLogs.length}
+          >
             复制可见
           </Button>
-          <Button icon={<ClipboardCopy size={15} />} onClick={() => copyLogs(filteredLogs)} disabled={!filteredLogs.length}>
-            复制全部
-          </Button>
-          <Button icon={<Download size={15} />} onClick={exportFilteredLogs} disabled={!filteredLogs.length}>
-            导出筛选
-          </Button>
-          <Button icon={<FolderOpen size={15} />} onClick={onOpenLogsDir}>
-            日志目录
-          </Button>
-          <Button icon={<Trash2 size={15} />} onClick={clearView} disabled={!logs.length}>
-            清空视图
-          </Button>
+          <Dropdown
+            trigger={["click"]}
+            menu={{
+              items: [
+                {
+                  key: "copy_all",
+                  label: "复制全部匹配",
+                  icon: <ClipboardCopy size={14} />,
+                  disabled: !filteredLogs.length,
+                },
+                {
+                  key: "export",
+                  label: "导出筛选结果",
+                  icon: <Download size={14} />,
+                  disabled: !filteredLogs.length,
+                },
+                {
+                  key: "open_dir",
+                  label: "打开日志目录",
+                  icon: <FolderOpen size={14} />,
+                },
+                {
+                  key: "clear",
+                  label: "清空当前视图",
+                  icon: <Trash2 size={14} />,
+                  disabled: !logs.length,
+                  danger: true,
+                },
+              ],
+              onClick: ({ key }: { key: string }) => runMoreAction(key),
+            }}
+          >
+            <Button icon={<MoreHorizontal size={15} />} loading={busyAction === "export"}>
+              更多
+            </Button>
+          </Dropdown>
         </SectionActions>
       </div>
 
@@ -198,11 +244,11 @@ export default function LogsPage({ logs, onOpenLogsDir }: LogsPageProps) {
                   style={{ transform: `translateY(${(visibleStart + index) * LOG_ROW_HEIGHT}px)` }}
                 >
                   <span className="log-time">{display.time}</span>
-                  <Tag>{entry.stream}</Tag>
-                  <span className="log-module" title={entry.module || "未标记"}>
-                    {entry.module || "-"}
+                  <Tag>{levelLabel(entry.level)}</Tag>
+                  <span className="log-module" title={displayLogModule(entry.module)}>
+                    {displayText(entry.module)}
                   </span>
-                  <code title={entry.raw || entry.line}>{display.message}</code>
+                  <code title={displayText(entry.raw, entry.line)}>{display.message}</code>
                 </div>
               );
             })}
@@ -215,34 +261,23 @@ export default function LogsPage({ logs, onOpenLogsDir }: LogsPageProps) {
   );
 }
 
-function formatLogLine(entry: LogEntry) {
-  const module = entry.module ? ` [${entry.module}]` : "";
-  return `[${entry.timestamp}] [${entry.serviceId}] [${entry.stream}]${module} ${entry.message || entry.line}`;
+async function formatLogsText(items: LogEntry[]) {
+  const chunkSize = 500;
+  const chunks: string[] = [];
+  for (let index = 0; index < items.length; index += chunkSize) {
+    chunks.push(
+      items
+        .slice(index, index + chunkSize)
+        .map(formatLogLine)
+        .join("\n"),
+    );
+    if (index + chunkSize < items.length) {
+      await yieldToBrowser();
+    }
+  }
+  return chunks.join("\n");
 }
 
-function getLogDisplay(entry: LogEntry) {
-  if (entry.message && entry.message !== entry.line) {
-    return {
-      time: formatLogTime(entry.timestamp),
-      message: entry.message,
-    };
-  }
-  const structured = entry.line.match(/^(\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+\[([^\]]+)\]\s*(.*)$/);
-  if (!structured) {
-    return {
-      time: formatLogTime(entry.timestamp),
-      message: entry.line,
-    };
-  }
-
-  return {
-    time: structured[1],
-    message: structured[3] || structured[2].trim(),
-  };
-}
-
-function formatLogTime(timestamp: string) {
-  const date = new Date(timestamp);
-  if (!Number.isNaN(date.getTime())) return date.toLocaleTimeString();
-  return timestamp;
+function yieldToBrowser() {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, 0));
 }

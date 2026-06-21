@@ -2,27 +2,30 @@
 
 ## 日志来源
 
-GSDesk 的日志模型分为四类来源：
+日志页只展示 Core JSONL 文件日志：
 
 - `core`：优先读取 `gsuid_core/data/logs` 下最新的 `.log` 或 `.jsonl` 文件。
+
+以下来源只用于任务状态、失败摘要和诊断包兜底，不进入日志页主视图：
+
 - `stdout`：Core 进程 stdout，用于启动阶段和兜底。
-- `stderr`：Core 进程 stderr，用于 Python traceback、依赖错误和崩溃现场。
+- `stderr`：Core 进程 stderr，用于 Python traceback、依赖错误和异常现场。
 - `system`：GSDesk 自己记录的初始化、启动、停止和修复动作。
 
 上游 `gsuid_core` 当前常见日志格式：
 
 ```json
-{"event":"[早柚核心] 插件加载完成! 总耗时: 3.00秒","level":"success","timestamp":"06-19 10:37:47"}
+{ "event": "[早柚核心] 插件加载完成! 总耗时: 3.00秒", "level": "info", "timestamp": "06-19 10:37:47" }
 ```
 
-GSDesk 会把 `event` 映射为 `message`，把 `level` 映射为 `info/success/warn/error`，把 `[早柚核心]` 这类前缀提取为 `module`。如果 event 内包含多行内容，会拆成多条日志，避免 UI 中出现多个时间戳挤在同一行。
+GSDesk 会把 `event` 映射为 `message`，把 `level` 归一为 `debug/info/warn/error`，把 `[早柚核心]` 这类前缀提取为 `module`。如果 event 内包含多行内容，会拆成多条日志，避免 UI 中出现多个时间戳挤在同一行。
 
 ## 兼容规则
 
 - JSONL 文件按文件偏移增量读取，不重复扫描整个文件。
 - 文件轮换或缩短时会从新文件开头读取。
 - 坏 JSON 行不会拖垮页面，会显示为 `JSONL parse_error`。
-- stdout/stderr 会去掉 ANSI 控制符，并拆分 `\r`、`\n` 和连续结构化时间戳。
+- stdout/stderr 会去掉 ANSI 控制符，并拆分 `\r`、`\n` 和连续结构化时间戳，但不混入日志页主视图。
 - Windows 子进程强制注入 UTF-8 与无颜色环境变量，避免中文和图标日志触发 GBK 编码错误。
 - Python logging/colorama 产生的 `UnicodeEncodeError: 'gbk' codec can't encode character` 噪声会按整块过滤；GSDesk 启动取状态时会清理旧 `logs/core.log` 中已经落盘的同类污染，诊断包也不会导出这类假错误。
 - GSDesk 自身的 `logs/core.log` 是诊断文本，只持久化 system 和 stdout/stderr 的 warn/error；emoji/符号会写成 `\u{...}`，避免用户在 GBK 控制台读取文本日志时二次报错。上游 JSONL 文件仍保留原始 UTF-8 内容，由日志页直接读取展示。
@@ -30,10 +33,9 @@ GSDesk 会把 `event` 映射为 `message`，把 `level` 映射为 `info/success/
 
 ## 前端展示
 
-日志页使用虚拟滚动，默认只渲染可视范围和少量 overscan。支持：
+日志页使用虚拟滚动，默认只渲染 Core JSONL 的可视范围和少量 overscan。支持：
 
 - 按等级过滤
-- 按来源过滤
 - 按模块过滤
 - 搜索 `message/module/raw/line/serviceId`
 - 复制可见日志
@@ -56,7 +58,7 @@ gsdesk-diagnostics-20260619-120000.zip
 - `state.json`：当前应用状态、服务状态、环境预检、任务历史。
 - `settings.json`：当前设置。
 - `system.txt`：诊断 schema、版本、OS、架构、关键路径和应用数据盘剩余空间。
-- `privacy.txt`：本机诊断、无自动上传、无遥测的隐私声明。
+- `privacy.txt`：本机诊断、无自动上传的隐私声明。
 - `uv.txt`：uv 解析来源、实际路径、版本或错误；解析顺序为隔离目录、打包资源、PATH。
 - `git.txt`：Git 版本或错误。
 - `ports.txt`：当前 Core 端口占用摘要。
@@ -70,7 +72,7 @@ gsdesk-diagnostics-20260619-120000.zip
 诊断页还会展示故障排查向导和最近错误摘要。向导不上传数据，只基于当前本地状态生成建议：
 
 - 环境预检阻断项和警告项。
-- Core `failed/crashed`、最近错误和 WebConsole 未就绪。
+- Core 失败、异常退出、最近错误和 WebConsole 未就绪。
 - 最近失败任务的阶段和消息。
 - 最近 traceback/错误段和常见错误的中文解释。
 - 壳更新检查失败时的网络处理建议。

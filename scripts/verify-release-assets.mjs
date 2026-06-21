@@ -46,10 +46,12 @@ console.log(`[release-assets] ${platform} ok: ${assetFiles.join(", ")}; ${checks
 function assertRequiredAssets(target, names) {
   if (target === "windows") {
     requireSome(names, /\.exe$/i, "Windows NSIS installer (.exe)");
+    requireSome(names, /\.exe\.sig$/i, "Windows updater signature (.exe.sig)");
     return;
   }
   requireSome(names, /\.dmg$/i, "macOS disk image (.dmg)");
-  requireSome(names, /\.app\.zip$/i, "macOS app archive (.app.zip)");
+  requireSome(names, /\.app\.tar\.gz$/i, "macOS updater archive (.app.tar.gz)");
+  requireSome(names, /\.app\.tar\.gz\.sig$/i, "macOS updater signature (.app.tar.gz.sig)");
 }
 
 function assertNonEmpty(names) {

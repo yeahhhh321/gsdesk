@@ -1,0 +1,23 @@
+repos:
+  - repo: local
+    hooks:
+      - id: gsdesk-format-check
+        name: GSDesk format check
+        entry: pnpm format:check
+        language: system
+        pass_filenames: false
+      - id: gsdesk-lint
+        name: GSDesk lint
+        entry: pnpm lint
+        language: system
+        pass_filenames: false
+      - id: gsdesk-build
+        name: GSDesk frontend build
+        entry: pnpm build
+        language: system
+        pass_filenames: false
+      - id: gsdesk-rust-tests
+        name: GSDesk Rust tests
+        entry: cargo test --manifest-path src-tauri/Cargo.toml
+        language: system
+        pass_filenames: false

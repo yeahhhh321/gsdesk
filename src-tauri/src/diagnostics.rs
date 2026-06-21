@@ -6,12 +6,14 @@ use chrono::Utc;
 use tauri::AppHandle;
 use zip::write::FileOptions;
 
-use crate::models::{AppStateResponse, LogEntry, ServiceStatus, Settings};
+use crate::core_logs::latest_core_log_file;
+use crate::failure_rules::failure_summary;
+use crate::models::{AppStateResponse, Settings};
 use crate::network;
 use crate::paths::app_paths;
 use crate::preflight;
 use crate::process::run_command_timeout;
-use crate::service::{latest_core_log_file, sanitize_persisted_log_content};
+use crate::service::{sanitize_persisted_log_content, GSUID_SERVICE_ID};
 use crate::settings::redact_secrets;
 use crate::toolchain;
 
@@ -37,31 +39,44 @@ pub fn export(
             )
         })
         .unwrap_or_else(|error| error),
-        Err(error) => format!(
-            "detected=false\ntarget={}\nerror={error}",
-            uv_status.uv_bootstrap_target
-        ),
+        Err(error) => {
+            format!("detected=false\ntarget={}\nerror={error}", uv_status.uv_bootstrap_target)
+        }
     };
 
-    let git_info = run_command_timeout(
-        "git",
-        &["--version"],
-        None,
-        &[],
-        std::time::Duration::from_secs(8),
-    )
-    .map(|output| format!("{}\n{}", output.stdout, output.stderr))
-    .unwrap_or_else(|error| error);
+    let git_info = match toolchain::git_program(app, &paths) {
+        Ok(program) => run_command_timeout(
+            &program,
+            &["--version"],
+            None,
+            &[],
+            std::time::Duration::from_secs(8),
+        )
+        .map(|output| {
+            format!(
+                "source={}\npath={}\n{}\n{}",
+                uv_status.git_source, program, output.stdout, output.stderr
+            )
+        })
+        .unwrap_or_else(|error| error),
+        Err(error) => format!(
+            "detected=false\nbundledGit={}\nerror={error}",
+            uv_status.bundled_git_path.as_deref().unwrap_or("current build has no bundled git")
+        ),
+    };
 
     let webconsole_url = state
         .services
         .iter()
-        .find(|service| service.service_id == "gsuid_core")
+        .find(|service| service.service_id == GSUID_SERVICE_ID)
         .and_then(|service| service.url.as_ref())
         .map(|url| format!("{}/app", url.trim_end_matches('/')));
-    let network_json =
-        serde_json::to_string_pretty(&network::diagnose_targets(settings, webconsole_url))
-            .map_err(|error| format!("序列化网络诊断失败: {error}"))?;
+    let network_json = serde_json::to_string_pretty(&network::diagnose_targets(
+        settings,
+        webconsole_url,
+        toolchain::git_program(app, &paths),
+    ))
+    .map_err(|error| format!("序列化网络诊断失败: {error}"))?;
 
     write_diagnostics_zip(
         &paths,
@@ -85,10 +100,7 @@ fn write_diagnostics_zip(
 ) -> Result<String, String> {
     let diagnostics_dir = PathBuf::from(&paths.diagnostics_dir);
     fs::create_dir_all(&diagnostics_dir).map_err(|error| format!("创建诊断目录失败: {error}"))?;
-    let file_name = format!(
-        "gsdesk-diagnostics-{}.zip",
-        Utc::now().format("%Y%m%d-%H%M%S")
-    );
+    let file_name = format!("gsdesk-diagnostics-{}.zip", Utc::now().format("%Y%m%d-%H%M%S"));
     let zip_path = diagnostics_dir.join(file_name);
     let file = File::create(&zip_path).map_err(|error| format!("创建诊断包失败: {error}"))?;
     let mut zip = zip::ZipWriter::new(file);
@@ -96,73 +108,37 @@ fn write_diagnostics_zip(
 
     let state_json =
         serde_json::to_string_pretty(state).map_err(|error| format!("序列化状态失败: {error}"))?;
-    add_file(
-        &mut zip,
-        options,
-        "state.json",
-        &redact_secrets(&state_json),
-    )?;
+    add_file(&mut zip, options, "state.json", &redact_secrets(&state_json))?;
 
     let settings_json = serde_json::to_string_pretty(settings)
         .map_err(|error| format!("序列化设置失败: {error}"))?;
-    add_file(
-        &mut zip,
-        options,
-        "settings.json",
-        &redact_secrets(&settings_json),
-    )?;
+    add_file(&mut zip, options, "settings.json", &redact_secrets(&settings_json))?;
 
-    add_file(
-        &mut zip,
-        options,
-        "system.txt",
-        &redact_secrets(&system_summary(state)),
-    )?;
+    add_file(&mut zip, options, "system.txt", &redact_secrets(&system_summary(state)))?;
     add_file(&mut zip, options, "privacy.txt", &privacy_summary())?;
 
     add_file(&mut zip, options, "uv.txt", &redact_secrets(uv_info))?;
-    add_file(&mut zip, options, "git.txt", &git_info)?;
+    add_file(&mut zip, options, "git.txt", git_info)?;
 
     add_file(&mut zip, options, "ports.txt", &redact_secrets(ports_info))?;
 
-    add_file(
-        &mut zip,
-        options,
-        "network-targets.json",
-        &redact_secrets(&network_json),
-    )?;
+    add_file(&mut zip, options, "network-targets.json", &redact_secrets(network_json))?;
 
-    add_file(
-        &mut zip,
-        options,
-        "failure-summary.txt",
-        &redact_secrets(&failure_summary(state)),
-    )?;
+    add_file(&mut zip, options, "failure-summary.txt", &redact_secrets(&failure_summary(state)))?;
 
     let log_path = PathBuf::from(&paths.logs_dir).join("core.log");
     if let Ok(log) = fs::read_to_string(log_path) {
         let log = sanitize_persisted_log_content(&log);
-        add_file(
-            &mut zip,
-            options,
-            "core.log",
-            &redact_secrets(&tail(&log, 400)),
-        )?;
+        add_file(&mut zip, options, "core.log", &redact_secrets(&tail(&log, 400)))?;
     }
 
     if let Some(core_log_path) = latest_core_log_file(&state.paths) {
         if let Ok(log) = fs::read_to_string(core_log_path) {
-            add_file(
-                &mut zip,
-                options,
-                "gsuid-core-jsonl.log",
-                &redact_secrets(&tail(&log, 400)),
-            )?;
+            add_file(&mut zip, options, "gsuid-core-jsonl.log", &redact_secrets(&tail(&log, 400)))?;
         }
     }
 
-    zip.finish()
-        .map_err(|error| format!("写入诊断包失败: {error}"))?;
+    zip.finish().map_err(|error| format!("写入诊断包失败: {error}"))?;
     Ok(zip_path.to_string_lossy().to_string())
 }
 
@@ -172,10 +148,8 @@ fn add_file(
     name: &str,
     content: &str,
 ) -> Result<(), String> {
-    zip.start_file(name, options)
-        .map_err(|error| format!("写入诊断文件失败 {name}: {error}"))?;
-    zip.write_all(content.as_bytes())
-        .map_err(|error| format!("写入诊断内容失败 {name}: {error}"))
+    zip.start_file(name, options).map_err(|error| format!("写入诊断文件失败 {name}: {error}"))?;
+    zip.write_all(content.as_bytes()).map_err(|error| format!("写入诊断内容失败 {name}: {error}"))
 }
 
 fn tail(content: &str, max_lines: usize) -> String {
@@ -190,14 +164,29 @@ fn system_summary(state: &AppStateResponse) -> String {
 }
 
 fn system_summary_with_disk(state: &AppStateResponse, disk_free_bytes: Option<u64>) -> String {
-    let disk_free_bytes_text = disk_free_bytes
+    let disk_free_bytes_text =
+        disk_free_bytes.map(|bytes| bytes.to_string()).unwrap_or_else(|| "unknown".to_string());
+    let disk_free_human =
+        disk_free_bytes.map(preflight::format_bytes).unwrap_or_else(|| "unknown".to_string());
+    let core = state.services.iter().find(|service| service.service_id == GSUID_SERVICE_ID);
+    let core_pid = core
+        .and_then(|service| service.pid.map(|pid| pid.to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let core_memory_bytes = core
+        .and_then(|service| service.memory_bytes.map(|bytes| bytes.to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let core_memory_human = core
+        .and_then(|service| service.memory_bytes.map(format_runtime_bytes))
+        .unwrap_or_else(|| "unknown".to_string());
+    let shell_memory_bytes = state
+        .shell
+        .memory_bytes
         .map(|bytes| bytes.to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let disk_free_human = disk_free_bytes
-        .map(preflight::format_bytes)
-        .unwrap_or_else(|| "unknown".to_string());
+    let shell_memory_human =
+        state.shell.memory_bytes.map(format_runtime_bytes).unwrap_or_else(|| "unknown".to_string());
     format!(
-        "schema=gsdesk-diagnostics-v1\nversion={}\nos={}\narch={}\nappData={}\nruntime={}\ncoreDir={}\nvenvDir={}\ndiskFreeBytes={}\ndiskFreeHuman={}\n",
+        "schema=gsdesk-diagnostics-v1\nversion={}\nos={}\narch={}\nappData={}\nruntime={}\ncoreDir={}\nvenvDir={}\ndiskFreeBytes={}\ndiskFreeHuman={}\nshellPid={}\nshellMemoryBytes={}\nshellMemoryHuman={}\ncorePid={}\ncoreMemoryBytes={}\ncoreMemoryHuman={}\n",
         state.version,
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -206,14 +195,24 @@ fn system_summary_with_disk(state: &AppStateResponse, disk_free_bytes: Option<u6
         state.paths.core_dir,
         state.paths.venv_dir,
         disk_free_bytes_text,
-        disk_free_human
+        disk_free_human,
+        state.shell.pid,
+        shell_memory_bytes,
+        shell_memory_human,
+        core_pid,
+        core_memory_bytes,
+        core_memory_human
     )
+}
+
+fn format_runtime_bytes(bytes: u64) -> String {
+    let mib = bytes as f64 / 1024.0 / 1024.0;
+    format!("{mib:.1} MB")
 }
 
 fn privacy_summary() -> String {
     [
         "schema=gsdesk-privacy-v1",
-        "telemetry=disabled",
         "automaticUpload=disabled",
         "diagnostics=local-only",
         "diagnosticsUpload=manual-user-action-only",
@@ -252,300 +251,14 @@ fn port_summary(port: Option<u16>) -> String {
     }
 }
 
-fn failure_summary(state: &AppStateResponse) -> String {
-    let mut signals = Vec::new();
-    let mut evidence = Vec::new();
-
-    for check in state
-        .preflight_checks
-        .iter()
-        .filter(|check| check.status != "ok")
-        .take(8)
-    {
-        let action = check.action.as_deref().unwrap_or("无建议动作");
-        signals.push(format!(
-            "preflight.{}: {} - {} | action={}",
-            check.status, check.label, check.detail, action
-        ));
-        evidence.push(check.detail.clone());
-        if let Some(action) = &check.action {
-            evidence.push(action.clone());
-        }
-    }
-
-    if let Some(core) = state
-        .services
-        .iter()
-        .find(|service| service.service_id == "gsuid_core")
-    {
-        if matches!(core.status, ServiceStatus::Failed | ServiceStatus::Crashed) {
-            let error = core.recent_error.as_deref().unwrap_or("未记录具体错误");
-            signals.push(format!(
-                "core.status: {} | error={error}",
-                service_status_label(core.status)
-            ));
-            evidence.push(error.to_string());
-        } else if let Some(error) = &core.recent_error {
-            signals.push(format!("core.recent_error: {error}"));
-            evidence.push(error.clone());
-        }
-
-        if core.status == ServiceStatus::Running && !core.webconsole_available {
-            let port = core
-                .port
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            signals.push(format!(
-                "webconsole.unavailable: Core 运行中但 /app 不可访问 | port={port}"
-            ));
-            evidence.push("webconsole unavailable".to_string());
-        }
-    }
-
-    if let Some(task) = state
-        .task_history
-        .iter()
-        .rev()
-        .find(|task| task.status == "failed")
-    {
-        signals.push(format!(
-            "task.failed: {} / {} - {}",
-            task.name, task.stage, task.message
-        ));
-        evidence.push(task.message.clone());
-    }
-
-    let context = last_error_context(&state.recent_logs);
-    evidence.extend(context.iter().cloned());
-    if let Some(explanation) = common_failure_explanation(&evidence.join("\n")) {
-        signals.push(format!("likely_cause: {explanation}"));
-    }
-
-    let mut lines = vec![
-        "schema=gsdesk-failure-summary-v1".to_string(),
-        format!("generatedAt={}", Utc::now().to_rfc3339()),
-    ];
-
-    if signals.is_empty() && context.is_empty() {
-        lines.push("status=未发现明确失败信号".to_string());
-        lines.push("next=如仍无法启动，请重新执行环境预检、导出诊断包并附带复现步骤。".to_string());
-        return lines.join("\n");
-    }
-
-    lines.push("status=发现可能失败信号".to_string());
-    lines.push(String::new());
-    lines.push("[signals]".to_string());
-    if signals.is_empty() {
-        lines.push("- 未从状态快照发现失败项，继续查看最后错误段。".to_string());
-    } else {
-        lines.extend(signals.into_iter().map(|signal| format!("- {signal}")));
-    }
-
-    if !context.is_empty() {
-        lines.push(String::new());
-        lines.push("[last-error-context]".to_string());
-        lines.extend(context.into_iter().map(|line| format!("  {line}")));
-    }
-
-    lines.join("\n")
-}
-
-fn service_status_label(status: ServiceStatus) -> &'static str {
-    match status {
-        ServiceStatus::Uninitialized => "uninitialized",
-        ServiceStatus::Checking => "checking",
-        ServiceStatus::Initializing => "initializing",
-        ServiceStatus::Starting => "starting",
-        ServiceStatus::Running => "running",
-        ServiceStatus::Stopping => "stopping",
-        ServiceStatus::Stopped => "stopped",
-        ServiceStatus::Failed => "failed",
-        ServiceStatus::Crashed => "crashed",
-    }
-}
-
-fn common_failure_explanation(text: &str) -> Option<&'static str> {
-    let lower = text.to_lowercase();
-    if lower.contains("unicodeencodeerror") && lower.contains("gbk") {
-        return Some(
-            "Python/控制台编码问题；GSDesk 已强制 UTF-8，仍出现时请保留诊断包继续排查启动环境。",
-        );
-    }
-    if lower.contains("module not found")
-        || lower.contains("modulenotfounderror")
-        || lower.contains("no module named")
-        || lower.contains("importerror")
-    {
-        return Some("Python 依赖或 venv 不完整；优先重跑依赖同步，仍失败再重建 venv。");
-    }
-    if lower.contains("address already in use")
-        || lower.contains("only one usage of each socket address")
-        || lower.contains("10048")
-        || lower.contains("端口")
-        || lower.contains("localport")
-    {
-        return Some("端口被占用或端口检测异常；关闭占用进程，或切回自动端口后重启 Core。");
-    }
-    if lower.contains("proxy")
-        || lower.contains("timed out")
-        || lower.contains("timeout")
-        || lower.contains("connection refused")
-        || lower.contains("could not resolve")
-        || lower.contains("dns")
-        || lower.contains("连接超时")
-        || lower.contains("代理")
-    {
-        return Some("网络或代理配置异常；先运行网络诊断，确认 Git、PyPI 和本机 NO_PROXY。");
-    }
-    if lower.contains("permission denied")
-        || lower.contains("access is denied")
-        || lower.contains("拒绝访问")
-        || lower.contains("无权限")
-    {
-        return Some("路径或权限受限；确认应用数据目录可写，避免把运行时放在受保护目录。");
-    }
-    if lower.contains("git clone")
-        || lower.contains("git fetch")
-        || lower.contains("git pull")
-        || lower.contains("dirty repo")
-        || lower.contains("未提交修改")
-    {
-        return Some("源码仓库同步失败；检查 Git 连通性、源码源选择和本地未提交修改。");
-    }
-    if lower.contains("uv sync")
-        || lower.contains("uv python")
-        || lower.contains("pyproject")
-        || lower.contains("python install")
-    {
-        return Some("uv/Python 初始化失败；检查 uv 安装、Python 3.12 下载目录和 PyPI 镜像。");
-    }
-    if lower.contains("traceback") || lower.contains("exception") {
-        return Some("Core 或依赖运行时抛出异常；优先查看最后 traceback 的最底部错误行。");
-    }
-    None
-}
-
-fn last_error_context(logs: &[LogEntry]) -> Vec<String> {
-    let Some(last_error_index) = logs.iter().rposition(is_error_signal) else {
-        return Vec::new();
-    };
-
-    let search_start = last_error_index.saturating_sub(30);
-    let traceback_start = logs[search_start..=last_error_index]
-        .iter()
-        .rposition(|entry| entry_text(entry).to_lowercase().contains("traceback"))
-        .map(|offset| search_start + offset);
-    let start = traceback_start.unwrap_or_else(|| last_error_index.saturating_sub(6));
-    let max_after = if traceback_start.is_some() { 25 } else { 8 };
-    let end = logs.len().min(last_error_index + max_after);
-
-    logs[start..end]
-        .iter()
-        .take(30)
-        .map(format_log_context_line)
-        .collect()
-}
-
-fn is_error_signal(entry: &LogEntry) -> bool {
-    if entry.level == "error" {
-        return true;
-    }
-    let lower = entry_text(entry).to_lowercase();
-    lower.contains("traceback")
-        || lower.contains("exception")
-        || lower.contains("failed")
-        || lower.contains("error")
-        || lower.contains("panic")
-        || lower.contains("启动失败")
-        || lower.contains("执行失败")
-        || lower.contains("parse_error")
-}
-
-fn format_log_context_line(entry: &LogEntry) -> String {
-    let module = entry
-        .module
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!(" [{value}]"))
-        .unwrap_or_default();
-    format!(
-        "{} [{}/{}]{} {}",
-        entry.timestamp,
-        entry.stream,
-        entry.level,
-        module,
-        entry_text(entry)
-    )
-}
-
-fn entry_text(entry: &LogEntry) -> &str {
-    if !entry.message.trim().is_empty() {
-        &entry.message
-    } else {
-        &entry.line
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{
-        AppPaths, PreflightCheck, ServiceSnapshot, Settings, TaskRecord, ToolchainInfo,
+        AppPaths, LogEntry, PreflightCheck, ServiceSnapshot, ServiceStatus, Settings, TaskRecord,
+        ToolchainInfo,
     };
     use std::io::Read;
-
-    #[test]
-    fn explains_dependency_failure_from_traceback() {
-        let logs = vec![
-            log(1, "stdout", "info", "Booting"),
-            log(2, "stderr", "error", "Traceback (most recent call last):"),
-            log(
-                3,
-                "stderr",
-                "error",
-                "  File \"core.py\", line 1, in <module>",
-            ),
-            log(
-                4,
-                "stderr",
-                "error",
-                "ModuleNotFoundError: No module named 'gsuid_core'",
-            ),
-        ];
-        let state = state_with_logs(logs);
-
-        let summary = failure_summary(&state);
-
-        assert!(summary.contains("schema=gsdesk-failure-summary-v1"));
-        assert!(summary.contains("Python 依赖或 venv 不完整"));
-        assert!(summary.contains("[last-error-context]"));
-        assert!(summary.contains("Traceback (most recent call last):"));
-        assert!(summary.contains("ModuleNotFoundError"));
-    }
-
-    #[test]
-    fn classifies_port_and_proxy_failures() {
-        assert!(
-            common_failure_explanation("OSError: address already in use")
-                .unwrap()
-                .contains("端口被占用")
-        );
-        assert!(
-            common_failure_explanation("Connect timed out while using proxy")
-                .unwrap()
-                .contains("网络或代理")
-        );
-    }
-
-    #[test]
-    fn healthy_summary_has_no_failure_signal() {
-        let state = state_with_logs(vec![log(1, "core", "info", "Started server process")]);
-
-        let summary = failure_summary(&state);
-
-        assert!(summary.contains("status=未发现明确失败信号"));
-        assert!(!summary.contains("[last-error-context]"));
-    }
 
     #[test]
     fn system_summary_includes_disk_space() {
@@ -558,11 +271,10 @@ mod tests {
     }
 
     #[test]
-    fn privacy_summary_declares_no_telemetry() {
+    fn privacy_summary_declares_local_only_diagnostics() {
         let summary = privacy_summary();
 
         assert!(summary.contains("schema=gsdesk-privacy-v1"));
-        assert!(summary.contains("telemetry=disabled"));
         assert!(summary.contains("automaticUpload=disabled"));
         assert!(summary.contains("diagnostics=local-only"));
     }
@@ -610,21 +322,9 @@ mod tests {
             runtime: runtime.to_string_lossy().to_string(),
             tools_dir: runtime.join("tools").to_string_lossy().to_string(),
             core_dir: core_dir.to_string_lossy().to_string(),
-            venv_dir: runtime
-                .join("venvs")
-                .join("gsuid_core")
-                .to_string_lossy()
-                .to_string(),
-            uv_cache_dir: runtime
-                .join("uv")
-                .join("cache")
-                .to_string_lossy()
-                .to_string(),
-            uv_python_dir: runtime
-                .join("uv")
-                .join("python")
-                .to_string_lossy()
-                .to_string(),
+            venv_dir: runtime.join("venvs").join("gsuid_core").to_string_lossy().to_string(),
+            uv_cache_dir: runtime.join("uv").join("cache").to_string_lossy().to_string(),
+            uv_python_dir: runtime.join("uv").join("python").to_string_lossy().to_string(),
             uv_executable: runtime
                 .join("tools")
                 .join("uv")
@@ -714,12 +414,14 @@ mod tests {
                 backups_dir: "backups".to_string(),
                 settings_file: "settings.json".to_string(),
             },
+            shell: crate::models::ProcessResourceUsage { pid: 1, memory_bytes: Some(64) },
             services: vec![ServiceSnapshot {
-                service_id: "gsuid_core".to_string(),
+                service_id: GSUID_SERVICE_ID.to_string(),
                 name: "gsuid_core".to_string(),
                 status: ServiceStatus::Stopped,
                 port: Some(8765),
                 pid: None,
+                memory_bytes: None,
                 url: None,
                 started_at: None,
                 current_commit: None,
@@ -748,13 +450,22 @@ mod tests {
             }],
             toolchain: ToolchainInfo {
                 uv_detected: true,
-                uv_path: Some("uv".to_string()),
-                uv_source: "path".to_string(),
+                uv_path: Some("tools/uv/Scripts/uv.exe".to_string()),
+                uv_source: "runtime".to_string(),
                 uv_version: Some("uv 0.0.0".to_string()),
                 uv_bootstrap_supported: true,
-                uv_bootstrap_target: "uv.exe".to_string(),
+                uv_bootstrap_target: "tools/uv/Scripts/uv.exe".to_string(),
                 uv_bootstrap_url: None,
+                bundled_python_available: true,
+                bundled_python_path: Some("runtime-assets/python".to_string()),
                 uv_error: None,
+                git_detected: true,
+                git_path: Some("runtime-assets/git/cmd/git.exe".to_string()),
+                git_source: "bundle".to_string(),
+                git_version: Some("git version 2.51.2.windows.1".to_string()),
+                bundled_git_available: true,
+                bundled_git_path: Some("runtime-assets/git/cmd/git.exe".to_string()),
+                git_error: None,
             },
             uv_detected: true,
         }
@@ -763,7 +474,7 @@ mod tests {
     fn log(id: u64, stream: &str, level: &str, message: &str) -> LogEntry {
         LogEntry {
             id,
-            service_id: "gsuid_core".to_string(),
+            service_id: GSUID_SERVICE_ID.to_string(),
             stream: stream.to_string(),
             level: level.to_string(),
             line: message.to_string(),

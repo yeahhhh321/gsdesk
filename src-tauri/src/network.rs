@@ -9,16 +9,8 @@ use crate::process::run_command_timeout;
 use crate::settings::env_from_settings;
 
 pub const SOURCES: &[(&str, &str, &str)] = &[
-    (
-        "github",
-        "GitHub",
-        "https://github.com/Genshin-bots/gsuid_core.git",
-    ),
-    (
-        "cnb",
-        "CNB 国内镜像",
-        "https://cnb.cool/gscore-mirror/gsuid_core.git",
-    ),
+    ("github", "GitHub", "https://github.com/Genshin-bots/gsuid_core.git"),
+    ("cnb", "CNB 国内镜像", "https://cnb.cool/gscore-mirror/gsuid_core.git"),
 ];
 
 pub const MIRRORS: &[(&str, &str)] = &[
@@ -26,33 +18,28 @@ pub const MIRRORS: &[(&str, &str)] = &[
     ("阿里", "https://mirrors.aliyun.com/pypi/simple/"),
     ("腾讯云", "https://mirrors.cloud.tencent.com/pypi/simple/"),
     ("火山引擎", "https://mirrors.volces.com/pypi/simple/"),
-    (
-        "华为云",
-        "https://mirrors.huaweicloud.com/repository/pypi/simple/",
-    ),
+    ("华为云", "https://mirrors.huaweicloud.com/repository/pypi/simple/"),
     ("清华大学", "https://pypi.tuna.tsinghua.edu.cn/simple/"),
-    (
-        "中国科学技术大学",
-        "https://mirrors.ustc.edu.cn/pypi/simple/",
-    ),
-    (
-        "北京外国语大学",
-        "https://mirrors.bfsu.edu.cn/pypi/web/simple/",
-    ),
-    (
-        "上海交通大学",
-        "https://mirror.sjtu.edu.cn/pypi/web/simple/",
-    ),
+    ("中国科学技术大学", "https://mirrors.ustc.edu.cn/pypi/simple/"),
+    ("北京外国语大学", "https://mirrors.bfsu.edu.cn/pypi/web/simple/"),
+    ("上海交通大学", "https://mirror.sjtu.edu.cn/pypi/web/simple/"),
     ("南京大学", "https://mirror.nju.edu.cn/pypi/web/simple/"),
 ];
 
-pub fn probe_sources(settings: &Settings) -> Vec<SourceProbeResult> {
-    let envs = env_from_settings(settings);
+pub fn probe_sources(
+    settings: &Settings,
+    git_program: Result<String, String>,
+) -> Vec<SourceProbeResult> {
+    let git_program = match git_program {
+        Ok(program) => program,
+        Err(error) => return source_probe_tool_missing(error),
+    };
+    let envs = git_probe_env(settings);
     let mut results = SOURCES
         .iter()
         .map(|(id, name, url)| {
             let output = run_command_timeout(
-                "git",
+                &git_program,
                 &["ls-remote", "--heads", url],
                 None,
                 &envs,
@@ -92,22 +79,14 @@ pub fn probe_sources(settings: &Settings) -> Vec<SourceProbeResult> {
 
 pub fn check_mirrors(settings: &Settings) -> Result<Vec<MirrorCheckResult>, String> {
     let client = mirror_client(settings)?;
-    let mut results = MIRRORS
-        .iter()
-        .map(|(name, url)| check_mirror(&client, name, url))
-        .collect::<Vec<_>>();
+    let mut results =
+        MIRRORS.iter().map(|(name, url)| check_mirror(&client, name, url)).collect::<Vec<_>>();
     results.sort_by(|a, b| {
         b.ok.cmp(&a.ok)
             .then_with(|| {
-                b.speed_mbps
-                    .partial_cmp(&a.speed_mbps)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                b.speed_mbps.partial_cmp(&a.speed_mbps).unwrap_or(std::cmp::Ordering::Equal)
             })
-            .then_with(|| {
-                a.latency_ms
-                    .unwrap_or(u128::MAX)
-                    .cmp(&b.latency_ms.unwrap_or(u128::MAX))
-            })
+            .then_with(|| a.latency_ms.unwrap_or(u128::MAX).cmp(&b.latency_ms.unwrap_or(u128::MAX)))
     });
     Ok(results)
 }
@@ -115,11 +94,15 @@ pub fn check_mirrors(settings: &Settings) -> Result<Vec<MirrorCheckResult>, Stri
 pub fn diagnose_targets(
     settings: &Settings,
     webconsole_url: Option<String>,
+    git_program: Result<String, String>,
 ) -> Vec<NetworkDiagnosticResult> {
-    let mut results = SOURCES
-        .iter()
-        .map(|(id, name, url)| diagnose_git_target(settings, id, name, url))
-        .collect::<Vec<_>>();
+    let mut results = match git_program {
+        Ok(program) => SOURCES
+            .iter()
+            .map(|(id, name, url)| diagnose_git_target(settings, &program, id, name, url))
+            .collect::<Vec<_>>(),
+        Err(error) => git_diagnostic_tool_missing(error),
+    };
     results.push(diagnose_http_target(
         settings,
         "pypi",
@@ -143,15 +126,16 @@ pub fn diagnose_targets(
 
 fn diagnose_git_target(
     settings: &Settings,
+    git_program: &str,
     id: &str,
     label: &str,
     url: &str,
 ) -> NetworkDiagnosticResult {
     let output = run_command_timeout(
-        "git",
+        git_program,
         &["ls-remote", "--heads", url],
         None,
-        &env_from_settings(settings),
+        &git_probe_env(settings),
         Duration::from_secs(12),
     );
     match output {
@@ -180,6 +164,41 @@ fn diagnose_git_target(
             error: Some(error),
         },
     }
+}
+
+fn source_probe_tool_missing(error: String) -> Vec<SourceProbeResult> {
+    SOURCES
+        .iter()
+        .map(|(id, name, url)| SourceProbeResult {
+            id: (*id).to_string(),
+            name: (*name).to_string(),
+            url: (*url).to_string(),
+            ok: false,
+            latency_ms: None,
+            error: Some(error.clone()),
+        })
+        .collect()
+}
+
+fn git_diagnostic_tool_missing(error: String) -> Vec<NetworkDiagnosticResult> {
+    SOURCES
+        .iter()
+        .map(|(id, name, url)| NetworkDiagnosticResult {
+            id: (*id).to_string(),
+            label: (*name).to_string(),
+            target: (*url).to_string(),
+            ok: false,
+            latency_ms: None,
+            error: Some(error.clone()),
+        })
+        .collect()
+}
+
+fn git_probe_env(settings: &Settings) -> Vec<(String, String)> {
+    let mut envs = env_from_settings(settings);
+    envs.push(("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()));
+    envs.push(("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()));
+    envs
 }
 
 fn diagnose_http_target(
@@ -303,9 +322,8 @@ fn no_proxy_covers_localhost(no_proxy: &str) -> bool {
 }
 
 fn mirror_client(settings: &Settings) -> Result<Client, String> {
-    let mut builder = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent("GSDesk/0.1 mirror-check");
+    let mut builder =
+        Client::builder().timeout(Duration::from_secs(10)).user_agent("GSDesk/0.1 mirror-check");
     builder = add_proxy(builder, "http", &settings.proxy.http_proxy)?;
     builder = add_proxy(builder, "https", &settings.proxy.https_proxy)?;
     if !settings.proxy.all_proxy.trim().is_empty() {
@@ -314,9 +332,7 @@ fn mirror_client(settings: &Settings) -> Result<Client, String> {
                 .map_err(|error| format!("ALL_PROXY 无效: {error}"))?,
         );
     }
-    builder
-        .build()
-        .map_err(|error| format!("创建镜像测速客户端失败: {error}"))
+    builder.build().map_err(|error| format!("创建镜像测速客户端失败: {error}"))
 }
 
 fn add_proxy(builder: ClientBuilder, scheme: &str, value: &str) -> Result<ClientBuilder, String> {
@@ -384,7 +400,8 @@ fn check_mirror(client: &Client, name: &str, base_url: &str) -> MirrorCheckResul
 }
 
 fn measure_speed(client: &Client, page: &str, page_url: &str) -> Result<f64, String> {
-    let href_re = Regex::new(r#"href="([^"]+)""#).unwrap();
+    let href_re = Regex::new(r#"href="([^"]+)""#)
+        .map_err(|error| format!("解析下载链接规则失败: {error}"))?;
     let mut links = href_re
         .captures_iter(page)
         .filter_map(|cap| cap.get(1).map(|m| m.as_str().to_string()))
@@ -431,12 +448,8 @@ mod tests {
 
     #[test]
     fn source_list_contains_required_hosts() {
-        assert!(SOURCES
-            .iter()
-            .any(|(_, _, url)| url.contains("github.com/Genshin-bots")));
-        assert!(SOURCES
-            .iter()
-            .any(|(_, _, url)| url.contains("cnb.cool/gscore-mirror")));
+        assert!(SOURCES.iter().any(|(_, _, url)| url.contains("github.com/Genshin-bots")));
+        assert!(SOURCES.iter().any(|(_, _, url)| url.contains("cnb.cool/gscore-mirror")));
     }
 
     #[test]

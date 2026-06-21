@@ -3,15 +3,7 @@ import type { ReactNode } from "react";
 
 const { Text, Title } = Typography;
 
-export function PanelHeader({
-  title,
-  description,
-  actions,
-}: {
-  title: string;
-  description?: ReactNode;
-  actions?: ReactNode;
-}) {
+export function PanelHeader({ title, description, actions }: { title: string; description?: ReactNode; actions?: ReactNode }) {
   return (
     <div className="panel-title-row">
       <div className="panel-title-copy">

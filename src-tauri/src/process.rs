@@ -37,10 +37,7 @@ pub fn run_command_timeout(
     let started = Instant::now();
     let mut command = Command::new(program);
     apply_default_child_env(&mut command);
-    command
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -48,9 +45,7 @@ pub fn run_command_timeout(
         command.env(key, value);
     }
     command.env_remove(LEGACY_WINDOWS_STDIO_ENV);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("执行命令失败 {program}: {error}"))?;
+    let mut child = command.spawn().map_err(|error| format!("执行命令失败 {program}: {error}"))?;
     let status = match child
         .wait_timeout(timeout)
         .map_err(|error| format!("等待命令失败 {program}: {error}"))?
@@ -73,9 +68,8 @@ pub fn run_command_timeout(
             });
         }
     };
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("读取命令输出失败 {program}: {error}"))?;
+    let output =
+        child.wait_with_output().map_err(|error| format!("读取命令输出失败 {program}: {error}"))?;
     Ok(CommandOutput {
         success: status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -95,6 +89,51 @@ pub fn apply_default_child_env(command: &mut Command) {
         .env("CLICOLOR", "0")
         .env("TERM", "dumb")
         .env_remove(LEGACY_WINDOWS_STDIO_ENV);
+}
+
+pub fn process_memory_bytes(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    if cfg!(windows) {
+        return windows_process_memory_bytes(pid);
+    }
+    unix_process_memory_bytes(pid)
+}
+
+fn windows_process_memory_bytes(pid: u32) -> Option<u64> {
+    let script = format!(
+        "$process = Get-Process -Id {pid} -ErrorAction SilentlyContinue; \
+         if ($process) {{ [int64]$process.WorkingSet64 }}"
+    );
+    let output = run_command_timeout(
+        "powershell",
+        &["-NoProfile", "-Command", &script],
+        None,
+        &[],
+        Duration::from_secs(5),
+    )
+    .ok()?;
+    if !output.success {
+        return None;
+    }
+    output.stdout.trim().parse::<u64>().ok()
+}
+
+fn unix_process_memory_bytes(pid: u32) -> Option<u64> {
+    let pid_arg = pid.to_string();
+    let output = run_command_timeout(
+        "ps",
+        &["-o", "rss=", "-p", &pid_arg],
+        None,
+        &[],
+        Duration::from_secs(5),
+    )
+    .ok()?;
+    if !output.success {
+        return None;
+    }
+    output.stdout.trim().parse::<u64>().ok().map(|kb| kb * 1024)
 }
 
 #[cfg(test)]
