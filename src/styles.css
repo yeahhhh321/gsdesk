@@ -215,7 +215,7 @@ select {
 
 .overview-control-grid {
   display: grid;
-  grid-template-columns: minmax(160px, 0.45fr) minmax(0, 1.55fr) auto;
+  grid-template-columns: minmax(160px, 0.42fr) minmax(0, 1.58fr) 176px;
   gap: 10px;
   align-items: stretch;
 }
@@ -290,36 +290,69 @@ select {
   font-size: 14px;
 }
 
-.overview-control-grid > .section-actions {
-  align-content: center;
-  justify-content: flex-end;
-}
-
-.overview-control-details {
+.overview-command-panel {
   min-width: 0;
   display: grid;
-  grid-template-columns: 132px minmax(0, 1fr);
-  gap: 12px;
+  align-content: center;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-control);
+  background: var(--color-surface);
+}
+
+.overview-command-panel .ant-btn {
+  justify-content: center;
+}
+
+.overview-control-sections {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
   align-items: start;
   margin-top: 10px;
   padding-top: 10px;
   border-top: 1px solid var(--color-border-soft);
 }
 
-.overview-control-detail-head {
+.overview-control-details,
+.overview-control-guide {
   min-width: 0;
   display: grid;
-  gap: 3px;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
 }
 
-.overview-control-detail-head strong {
+.overview-control-guide {
+  padding-top: 10px;
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.overview-control-section-head {
+  min-width: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.overview-control-section-head > div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.overview-control-section-head strong {
   color: var(--color-muted-strong);
   font-size: 14px;
 }
 
-.overview-control-detail-head small {
+.overview-control-section-head small {
   min-width: 0;
   color: var(--color-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .overview-control-detail-groups {
@@ -342,6 +375,24 @@ select {
 
 .overview-control-details .overview-subsection:last-child .overview-info-grid {
   grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.wizard-line.overview-inline-guide {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+}
+
+.wizard-line.overview-inline-guide .wizard-step {
+  min-height: 38px;
+  padding: 6px 8px;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.wizard-line.overview-inline-guide .wizard-step span {
+  width: 20px;
+  height: 20px;
 }
 
 .overview-subsection {
@@ -436,24 +487,6 @@ select {
 .overview-more-line {
   margin: 0;
   font-size: 12px;
-}
-
-.overview-guide-panel .wizard-line {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
-  margin: 6px 0 0;
-}
-
-.overview-guide-panel .wizard-step {
-  min-height: 38px;
-  padding: 6px 8px;
-  gap: 6px;
-  font-size: 12px;
-}
-
-.overview-guide-panel .wizard-step span {
-  width: 20px;
-  height: 20px;
 }
 
 .overview-dashboard .ant-tag {
@@ -1420,13 +1453,23 @@ select {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .overview-control-sections,
   .overview-control-details,
+  .overview-control-guide,
   .overview-control-detail-groups {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .overview-control-grid > .section-actions {
-    justify-content: flex-start;
+  .wizard-line.overview-inline-guide {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .overview-command-panel {
+    align-content: stretch;
+  }
+
+  .overview-command-panel .ant-btn {
+    width: 100%;
   }
 
   .network-settings-layout {
@@ -1610,7 +1653,7 @@ select {
   .overview-control-details .overview-subsection:first-child .overview-info-grid,
   .overview-control-details .overview-subsection:last-child .overview-info-grid,
   .settings-summary-grid,
-  .overview-guide-panel .wizard-line,
+  .wizard-line.overview-inline-guide,
   .wizard-line,
   .form-grid,
   .guide-summary-grid {

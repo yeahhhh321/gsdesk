@@ -83,6 +83,8 @@ test("overview and first install guide are usable", async ({ page }) => {
   await expect(overviewNetworkTools.getByText("源码源", { exact: true })).toBeVisible();
   await expect(overviewNetworkTools.getByText("Git", { exact: true })).toBeVisible();
   await expect(overviewNetworkTools.getByText("Playwright", { exact: true })).toBeVisible();
+  const overviewGuide = controlStrip.getByLabel("首次安装引导");
+  await expect(overviewGuide.getByText("首次安装引导", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "运行路径" })).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "操作记录" })).toHaveCount(0);
   await expect(page.getByRole("menuitem", { name: "操作记录" })).toHaveCount(0);
@@ -90,10 +92,11 @@ test("overview and first install guide are usable", async ({ page }) => {
   await expect(page.getByText("NoneBot2", { exact: true })).toHaveCount(0);
   await expect(page.getByText("Core 目录")).toHaveCount(0);
   await expect(page.getByText("uv sync 网络超时")).toHaveCount(0);
-  await expect(controlStrip.getByRole("button", { name: "启动 Core" })).toBeVisible();
-  await expect(controlStrip.getByRole("button", { name: "停止" })).toHaveCount(0);
-  await expect(controlStrip.getByRole("button", { name: "重启" })).toHaveCount(0);
-  await expect(controlStrip.getByRole("button", { name: "打开 WebConsole" })).toBeVisible();
+  const coreActions = controlStrip.getByLabel("Core 操作");
+  await expect(coreActions.getByRole("button", { name: "启动 Core" })).toBeVisible();
+  await expect(coreActions.getByRole("button", { name: "停止" })).toHaveCount(0);
+  await expect(coreActions.getByRole("button", { name: "重启" })).toHaveCount(0);
+  await expect(coreActions.getByRole("button", { name: "打开 WebConsole" })).toBeVisible();
 
   await expect(page.getByTestId("install-guide")).toBeVisible();
   await expect(page.getByTestId("install-guide").getByRole("heading", { name: "首次安装引导" })).toBeVisible();
@@ -106,7 +109,7 @@ test("overview and first install guide are usable", async ({ page }) => {
   await page.getByRole("button", { name: "展开侧边栏" }).click();
   await expect(page.locator(".sidebar.ant-layout-sider-collapsed")).toHaveCount(0);
 
-  await page.locator(".overview-guide-panel").getByRole("button", { name: "打开引导" }).click();
+  await overviewGuide.getByRole("button", { name: "打开引导" }).click();
   await expect(page.getByTestId("install-guide")).toBeVisible();
   await expect(page.getByText("环境预检与网络")).toBeVisible();
 });

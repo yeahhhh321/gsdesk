@@ -138,8 +138,10 @@ export default function OverviewPage({
               />
             )}
           </div>
-          <SectionActions>
+          <div className="overview-command-panel" aria-label="Core 操作">
+            <Text type="secondary">Core 操作</Text>
             <Button
+              block
               type={lifecycleAction.kind === "start" ? "primary" : "default"}
               icon={lifecycleAction.kind === "stop" ? <Square size={16} /> : <Play size={16} />}
               loading={lifecycleLoading}
@@ -148,25 +150,14 @@ export default function OverviewPage({
             >
               {lifecycleAction.label}
             </Button>
-            <Button icon={<ExternalLink size={16} />} loading={loadingAction === "open_webconsole"} onClick={onOpenWebconsole}>
+            <Button
+              block
+              icon={<ExternalLink size={16} />}
+              loading={loadingAction === "open_webconsole"}
+              onClick={onOpenWebconsole}
+            >
               打开 WebConsole
             </Button>
-          </SectionActions>
-        </div>
-        <div className="overview-control-details" aria-label="网络与工具">
-          <div className="overview-control-detail-head">
-            <strong>网络与工具</strong>
-            <small>只展示当前网络源和本地工具状态，处理入口仍在检测处理</small>
-          </div>
-          <div className="overview-control-detail-groups">
-            <div className="overview-subsection">
-              <strong>网络</strong>
-              <OverviewInfoGrid items={networkItems} />
-            </div>
-            <div className="overview-subsection">
-              <strong>工具</strong>
-              <OverviewInfoGrid items={toolItems} />
-            </div>
           </div>
         </div>
         {nextAction && (
@@ -190,6 +181,51 @@ export default function OverviewPage({
             }
           />
         )}
+        <div className="overview-control-sections">
+          <div className="overview-control-details" aria-label="网络与工具">
+            <div className="overview-control-section-head">
+              <div>
+                <strong>网络与工具</strong>
+                <small>只展示当前网络源和本地工具状态，处理入口仍在检测处理</small>
+              </div>
+            </div>
+            <div className="overview-control-detail-groups">
+              <div className="overview-subsection">
+                <strong>网络</strong>
+                <OverviewInfoGrid items={networkItems} />
+              </div>
+              <div className="overview-subsection">
+                <strong>工具</strong>
+                <OverviewInfoGrid items={toolItems} />
+              </div>
+            </div>
+          </div>
+          <div className="overview-control-guide" aria-label="首次安装引导">
+            <div className="overview-control-section-head">
+              <div>
+                <strong>首次安装引导</strong>
+                <small>按顺序完成预检、源、运行时和 WebConsole</small>
+              </div>
+              <Button size="small" type="primary" icon={<Wrench size={14} />} onClick={() => onOpenInstallGuide(0)}>
+                打开引导
+              </Button>
+            </div>
+            <div className="wizard-line overview-inline-guide">
+              {setupChecklist.map((step, index) => (
+                <button
+                  type="button"
+                  key={step.label}
+                  className={`wizard-step ${step.done ? "ready" : ""}`}
+                  onClick={() => onOpenInstallGuide(index)}
+                >
+                  <span>{step.done ? "✓" : index + 1}</span>
+                  <strong>{step.label}</strong>
+                  <small>{step.detail}</small>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
 
       <div className="wide-panel overview-preflight-panel overview-compact-panel">
@@ -247,31 +283,6 @@ export default function OverviewPage({
           </div>
         </div>
       )}
-
-      <div className="wide-panel overview-guide-panel overview-compact-panel">
-        <PanelHeader
-          title="首次安装引导"
-          actions={
-            <Button type="primary" icon={<Wrench size={16} />} onClick={() => onOpenInstallGuide(0)}>
-              打开引导
-            </Button>
-          }
-        />
-        <div className="wizard-line">
-          {setupChecklist.map((step, index) => (
-            <button
-              type="button"
-              key={step.label}
-              className={`wizard-step ${step.done ? "ready" : ""}`}
-              onClick={() => onOpenInstallGuide(index)}
-            >
-              <span>{step.done ? "✓" : index + 1}</span>
-              <strong>{step.label}</strong>
-              <small>{step.detail}</small>
-            </button>
-          ))}
-        </div>
-      </div>
     </section>
   );
 }
