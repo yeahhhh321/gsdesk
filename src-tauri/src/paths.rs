@@ -25,6 +25,7 @@ pub fn build_paths_with_settings(
     let uv_cache_dir = runtime.join("uv").join("cache");
     let uv_python_dir = runtime.join("uv").join("python");
     let uv_executable = tools_dir.join("uv").join(uv_scripts_dir_name()).join(uv_executable_name());
+    let playwright_browsers_dir = runtime.join("playwright").join("browsers");
     let backups_dir = runtime.join("backups");
     let logs_dir = base.join("logs");
     let diagnostics_dir = base.join("diagnostics");
@@ -36,6 +37,7 @@ pub fn build_paths_with_settings(
         &tools_dir,
         &uv_cache_dir,
         &uv_python_dir,
+        &playwright_browsers_dir,
         &backups_dir,
         &logs_dir,
         &diagnostics_dir,
@@ -55,6 +57,7 @@ pub fn build_paths_with_settings(
             uv_cache_dir: display_path(&uv_cache_dir),
             uv_python_dir: display_path(&uv_python_dir),
             uv_executable: display_path(&uv_executable),
+            playwright_browsers_dir: display_path(&playwright_browsers_dir),
             logs_dir: display_path(&logs_dir),
             diagnostics_dir: display_path(&diagnostics_dir),
             backups_dir: display_path(&backups_dir),

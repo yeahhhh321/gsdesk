@@ -285,16 +285,10 @@ function delay(ms) {
 function defaultCoreDir() {
   if (process.env.GSUID_CORE_DIR) return process.env.GSUID_CORE_DIR;
   if (process.platform === "win32") {
-    return join(
-      process.env.APPDATA || join(homedir(), "AppData", "Roaming"),
-      "com.yeahhhh321.gsdesk",
-      "runtime",
-      "core",
-      "gsuid_core",
-    );
+    return join(process.env.APPDATA || join(homedir(), "AppData", "Roaming"), "com.core.gsdesk", "runtime", "core", "gsuid_core");
   }
   if (process.platform === "darwin") {
-    return join(homedir(), "Library", "Application Support", "com.yeahhhh321.gsdesk", "runtime", "core", "gsuid_core");
+    return join(homedir(), "Library", "Application Support", "com.core.gsdesk", "runtime", "core", "gsuid_core");
   }
   return join(tmpdir(), "gsdesk-runtime", "core", "gsuid_core");
 }

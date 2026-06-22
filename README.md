@@ -74,7 +74,7 @@ GSDesk app data
 
 安装包资源包含 `runtime-assets/git` 与 `runtime-assets/python`；小白用户不需要安装系统 Git 或 Python。
 
-Windows 当前位于 `%APPDATA%\com.yeahhhh321.gsdesk`，macOS 位于 `~/Library/Application Support/com.yeahhhh321.gsdesk`。
+Windows 当前位于 `%APPDATA%\com.core.gsdesk`，macOS 位于 `~/Library/Application Support/com.core.gsdesk`。
 
 ## 首次使用
 

@@ -2,9 +2,7 @@ import { lazy, Suspense } from "react";
 import { Layout } from "antd";
 import { useAppController } from "./appController";
 import { AppHeader, AppSidebar } from "./ui/appShell";
-import type { DiagnosticsSection } from "./pages/DiagnosticsPage";
 import type { EnvironmentSection } from "./pages/EnvironmentPage";
-import type { NetworkSection } from "./pages/NetworkPage";
 import type { AppSectionKey } from "./ui/appSections";
 
 const { Content } = Layout;
@@ -13,10 +11,7 @@ const OverviewPage = lazy(() => import("./pages/OverviewPage"));
 const WebconsolePage = lazy(() => import("./pages/WebconsolePage"));
 const LogsPage = lazy(() => import("./pages/LogsPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
-const ShellUpdatePage = lazy(() => import("./pages/ShellUpdatePage"));
 const EnvironmentPage = lazy(() => import("./pages/EnvironmentPage"));
-const NetworkPage = lazy(() => import("./pages/NetworkPage"));
-const DiagnosticsPage = lazy(() => import("./pages/DiagnosticsPage"));
 const InstallGuide = lazy(() => import("./ui/InstallGuide").then((module) => ({ default: module.InstallGuide })));
 
 function App() {
@@ -38,6 +33,7 @@ function App() {
             onOpenWebconsole={controller.openWebconsole}
             onOpenInstallGuide={controller.openInstallGuide}
             onOpenEnvironment={() => controller.setActiveKey("environment_runtime")}
+            onOpenOperations={() => controller.setActiveKey("operation_records")}
             onOpenLogs={() => controller.setActiveKey("logs")}
           />
         );
@@ -62,32 +58,30 @@ function App() {
         return (
           <SettingsPage
             appState={controller.appState}
+            sourceResults={controller.sourceResults}
+            mirrorResults={controller.mirrorResults}
             loadingAction={controller.loadingAction}
+            onProbeSources={controller.probeSources}
+            onCheckMirrors={controller.checkMirrors}
             onSaveSettings={controller.saveSettings}
-          />
-        );
-      case "shell_update":
-        return (
-          <ShellUpdatePage
-            updateInfo={controller.updateInfo}
-            loadingAction={controller.loadingAction}
-            onCheckShellUpdate={controller.checkShellUpdate}
-            onInstallShellUpdate={controller.installShellUpdate}
+            onSelectDirectory={controller.selectDirectory}
+            onOpenPath={controller.openPath}
           />
         );
       case "environment_runtime":
-      case "environment_repair":
       case "environment_update":
-      case "environment_data":
-      case "environment_tasks":
+      case "operation_records":
         if (!controller.appState) return <PageFallback />;
         return (
           <EnvironmentPage
             section={environmentSection(controller.activeKey)}
             appState={controller.appState}
+            logs={controller.visibleLogs}
+            updateInfo={controller.updateInfo}
             loadingAction={controller.loadingAction}
             onInitRuntime={controller.initRuntime}
             onBootstrapUv={controller.bootstrapUv}
+            onInstallPlaywright={controller.installPlaywright}
             onRepairRuntime={controller.repairRuntime}
             onClearOccupiedPort={controller.clearOccupiedPort}
             onCoreUpdate={controller.coreUpdate}
@@ -97,36 +91,6 @@ function App() {
             onRestoreRuntimeBackup={controller.restoreRuntimeBackup}
             onClearAppData={controller.clearAppData}
             onRefreshState={controller.refreshState}
-          />
-        );
-      case "network_settings":
-      case "network_checks":
-        if (!controller.appState) return <PageFallback />;
-        return (
-          <NetworkPage
-            section={networkSection(controller.activeKey)}
-            appState={controller.appState}
-            sourceResults={controller.sourceResults}
-            mirrorResults={controller.mirrorResults}
-            networkDiagnostics={controller.networkDiagnostics}
-            loadingAction={controller.loadingAction}
-            onProbeSources={controller.probeSources}
-            onCheckMirrors={controller.checkMirrors}
-            onTestNetworkTargets={controller.testNetworkTargets}
-            onSaveSettings={controller.saveSettings}
-          />
-        );
-      case "diagnostics_export":
-      case "diagnostics_failures":
-        if (!controller.appState) return <PageFallback />;
-        return (
-          <DiagnosticsPage
-            section={diagnosticsSection(controller.activeKey)}
-            appState={controller.appState}
-            logs={controller.visibleLogs}
-            updateInfo={controller.updateInfo}
-            loadingAction={controller.loadingAction}
-            onExportDiagnostics={controller.exportDiagnostics}
           />
         );
       default:
@@ -143,6 +107,10 @@ function App() {
           version={controller.appState?.version}
           beginnerMode={controller.appState?.settings.beginnerMode !== false}
           onSelect={controller.setActiveKey}
+          updateInfo={controller.updateInfo}
+          loadingAction={controller.loadingAction}
+          onCheckShellUpdate={controller.checkShellUpdate}
+          onInstallShellUpdate={controller.installShellUpdate}
         />
         <Layout>
           <AppHeader activeKey={controller.activeKey} onRefresh={controller.refreshState} />
@@ -166,9 +134,7 @@ function App() {
             onStepChange={controller.setInstallStep}
             onOpenNetwork={() => {
               controller.setInstallGuideOpen(false);
-              controller.setActiveKey(
-                controller.appState?.settings.beginnerMode === false ? "network_settings" : "network_checks",
-              );
+              controller.setActiveKey("settings");
             }}
             onOpenLogs={() => {
               controller.setInstallGuideOpen(false);
@@ -187,20 +153,9 @@ function App() {
   );
 }
 
-function networkSection(route: AppSectionKey): NetworkSection {
-  return route === "network_checks" ? "checks" : "settings";
-}
-
 function environmentSection(route: AppSectionKey): EnvironmentSection {
-  if (route === "environment_repair") return "repair";
-  if (route === "environment_update") return "update";
-  if (route === "environment_data") return "data";
-  if (route === "environment_tasks") return "tasks";
-  return "runtime";
-}
-
-function diagnosticsSection(route: AppSectionKey): DiagnosticsSection {
-  return route === "diagnostics_failures" ? "failures" : "export";
+  if (route === "operation_records") return "tasks";
+  return route === "environment_update" ? "core" : "workbench";
 }
 
 function PageFallback() {

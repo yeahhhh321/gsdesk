@@ -1,7 +1,5 @@
 mod core_logs;
 mod data_cleanup;
-mod diagnostics;
-mod failure_rules;
 mod models;
 mod network;
 mod paths;
@@ -455,6 +453,21 @@ async fn bootstrap_uv(
 }
 
 #[tauri::command]
+async fn install_playwright(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+) -> Result<AppStateResponse, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "install_playwright", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        service::install_playwright(&action_app, &runtime, &settings)?;
+        app_state(&action_app, &runtime)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn check_service_health(
     app: AppHandle,
     runtime: State<'_, SharedRuntime>,
@@ -528,21 +541,6 @@ async fn stream_logs(
 }
 
 #[tauri::command]
-async fn export_diagnostics(
-    app: AppHandle,
-    runtime: State<'_, SharedRuntime>,
-) -> Result<String, String> {
-    let runtime = runtime.inner().clone();
-    let action_app = app.clone();
-    run_action(app, "export_diagnostics", move || {
-        let settings = load_settings_for_app(&action_app)?;
-        let state = app_state(&action_app, &runtime)?;
-        diagnostics::export(&action_app, &state, &settings)
-    })
-    .await
-}
-
-#[tauri::command]
 async fn check_shell_update(app: AppHandle) -> Result<UpdateInfo, String> {
     let result = Ok(update::check_shell_update(&app).await);
     emit_action_result(&app, "check_shell_update", &result);
@@ -568,6 +566,7 @@ async fn open_path(app: AppHandle, key: String) -> Result<(), String> {
             "runtime" => PathBuf::from(paths.runtime),
             "toolsDir" => PathBuf::from(paths.tools_dir),
             "coreDir" => PathBuf::from(paths.core_dir),
+            "corePluginsDir" => PathBuf::from(paths.core_dir).join("plugins"),
             "venvDir" => PathBuf::from(paths.venv_dir),
             "uvCacheDir" => PathBuf::from(paths.uv_cache_dir),
             "uvPythonDir" => PathBuf::from(paths.uv_python_dir),
@@ -666,6 +665,7 @@ fn app_state_with_options(
 
 pub fn run() {
     let result = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(SharedRuntime::default())
@@ -718,11 +718,11 @@ pub fn run() {
             export_settings,
             import_settings,
             bootstrap_uv,
+            install_playwright,
             check_service_health,
             open_webconsole,
             open_external_url,
             stream_logs,
-            export_diagnostics,
             check_shell_update,
             install_shell_update,
             open_path

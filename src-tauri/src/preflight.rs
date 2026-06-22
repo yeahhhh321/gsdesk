@@ -185,7 +185,7 @@ fn check_fixed_port(port: u16, services: &[ServiceSnapshot]) -> PreflightCheck {
             "port",
             "固定端口",
             format!("{port} 不在允许范围 1024-65535"),
-            "清空固定端口改为自动，或填写 1024-65535 之间的端口",
+            "填写 1024-65535 之间的可用端口",
         );
     }
     if let Some(core) = core_service_on_port(services, port) {
@@ -200,7 +200,7 @@ fn check_fixed_port(port: u16, services: &[ServiceSnapshot]) -> PreflightCheck {
                 "{port} 已被监听进程占用，占用信息: {}，固定端口模式不会自动切换",
                 occupants_summary(&occupants)
             ),
-            "点击“强杀端口占用”，或清空固定端口改回自动选择",
+            "点击“强杀端口占用”，或改成其他可用端口",
         ),
         Err(error) => block(
             "port",
@@ -219,7 +219,7 @@ fn check_fixed_bind_state(port: u16) -> PreflightCheck {
             "port",
             "固定端口",
             format!("{port} 暂不可绑定，但没有监听进程；固定端口模式不会自动切换"),
-            "稍后重新检测端口，或清空固定端口改回自动选择",
+            "稍后重新检测端口，或改成其他可用端口",
         )
     }
 }
@@ -415,6 +415,7 @@ mod tests {
             uv_cache_dir: "cache".into(),
             uv_python_dir: "py".into(),
             uv_executable: "tools/uv/Scripts/uv.exe".into(),
+            playwright_browsers_dir: "playwright".into(),
             logs_dir: "logs".into(),
             diagnostics_dir: "diagnostics".into(),
             backups_dir: "backups".into(),
@@ -438,6 +439,9 @@ mod tests {
             bundled_python_available: true,
             bundled_python_path: Some("runtime-assets/python".into()),
             uv_error: None,
+            playwright_detected: false,
+            playwright_browsers_path: "playwright".into(),
+            playwright_error: Some("未安装 Playwright 浏览器".into()),
             git_detected: true,
             git_path: Some("runtime-assets/git/cmd/git.exe".into()),
             git_source: "bundle".into(),

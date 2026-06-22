@@ -1,7 +1,7 @@
 import type { ColumnsType } from "antd/es/table";
 import { displayMegabytesPerSecond, displayMilliseconds, displayValue } from "../ui/format";
 import { ResultTag } from "../ui/primitives";
-import type { MirrorCheckResult, NetworkDiagnosticResult, SourceProbeResult } from "../types";
+import type { MirrorCheckResult, SourceProbeResult } from "../types";
 
 const resultColumn = <T extends { ok: boolean }>(width = 100) => ({
   title: "状态",
@@ -36,13 +36,5 @@ export const mirrorColumns: ColumnsType<MirrorCheckResult> = [
   resultColumn<MirrorCheckResult>(),
   latencyColumn<MirrorCheckResult>(),
   { title: "速度", width: 120, render: (_: unknown, row: MirrorCheckResult) => displayMegabytesPerSecond(row.speedMbps) },
-  errorColumn,
-];
-
-export const diagnosticColumns: ColumnsType<NetworkDiagnosticResult> = [
-  { title: "目标", dataIndex: "label", width: 150 },
-  { title: "地址", dataIndex: "target", ellipsis: true },
-  resultColumn<NetworkDiagnosticResult>(),
-  latencyColumn<NetworkDiagnosticResult>(),
   errorColumn,
 ];

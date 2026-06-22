@@ -12,7 +12,6 @@ import type {
   CoreUpdateResult,
   LogEntry,
   MirrorCheckResult,
-  NetworkDiagnosticResult,
   RuntimeRestoreResult,
   ServiceSnapshot,
   Settings,
@@ -30,6 +29,8 @@ const LOG_FLUSH_DELAY_MS = 80;
 const STATE_REFRESH_DELAY_MS = 120;
 const WEBCONSOLE_READY_TIMEOUT_MS = 75_000;
 const INSTALL_GUIDE_SEEN_KEY = "gsdesk.installGuide.seen";
+const SHELL_UPDATE_LAST_AUTO_CHECK_KEY = "gsdesk.shellUpdate.lastAutoCheckAt";
+const SHELL_UPDATE_AUTO_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 type RepairAction = "sync_deps" | "rebuild_venv" | "reclone_core" | "clear_uv_cache";
 type CoreUpdateAction = "check" | "clean" | "list_commits" | "update" | "rollback";
@@ -50,7 +51,6 @@ export function useAppController() {
   const [setupRunning, setSetupRunning] = useState(false);
   const [sourceResults, setSourceResults] = useState<SourceProbeResult[]>([]);
   const [mirrorResults, setMirrorResults] = useState<MirrorCheckResult[]>([]);
-  const [networkDiagnostics, setNetworkDiagnostics] = useState<NetworkDiagnosticResult[]>([]);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo>();
   const [webconsoleUrl, setWebconsoleUrl] = useState("");
   const [webconsoleFrameVersion, setWebconsoleFrameVersion] = useState(0);
@@ -101,7 +101,7 @@ export function useAppController() {
       !(
         activeKeyRef.current === "overview" ||
         activeKeyRef.current === "logs" ||
-        activeKeyRef.current.startsWith("diagnostics_")
+        activeKeyRef.current === "environment_runtime"
       ) ||
       logFrameRef.current
     ) {
@@ -208,10 +208,6 @@ export function useAppController() {
       setMirrorResults(result);
       return;
     }
-    if (event.action === "test_network_targets" && isNetworkDiagnosticResults(result)) {
-      setNetworkDiagnostics(result);
-      return;
-    }
     if (event.action === "check_shell_update" && isUpdateInfo(result)) {
       setUpdateInfo(result);
     }
@@ -298,13 +294,6 @@ export function useAppController() {
     return ok;
   }
 
-  async function testNetworkTargets() {
-    const result = await runAction<NetworkDiagnosticResult[]>("test_network", gsdeskApi.testNetworkTargets);
-    if (!result) return false;
-    setNetworkDiagnostics(result);
-    return result.some((item) => item.ok);
-  }
-
   async function initRuntime() {
     const result = await runAction<AppState>("init", gsdeskApi.initCoreRuntime, "初始化任务已完成");
     if (!result) return false;
@@ -381,6 +370,13 @@ export function useAppController() {
     return true;
   }
 
+  async function installPlaywright() {
+    const result = await runAction<AppState>("install_playwright", gsdeskApi.installPlaywright, "Playwright 已安装到隔离目录");
+    if (!result) return false;
+    setAppState(result);
+    return true;
+  }
+
   async function coreUpdate(action: CoreUpdateAction, channel: CoreUpdateChannel = "latest", targetCommit?: string) {
     const result = await runAction<CoreUpdateResult>(`core_${action}`, () => gsdeskApi.coreUpdate(action, channel, targetCommit));
     if (!result) return undefined;
@@ -404,6 +400,7 @@ export function useAppController() {
 
     if (task.name === "初始化运行时") return initRuntime();
     if (task.name === "安装 uv") return bootstrapUv();
+    if (task.name === "安装 Playwright") return installPlaywright();
     if (task.name === "启动 Core") return startCore();
     if (task.name === "运行时修复") {
       const action = normalizeRepairAction(task.stage);
@@ -464,7 +461,6 @@ export function useAppController() {
     setLogsVersion((version) => version + 1);
     setSourceResults([]);
     setMirrorResults([]);
-    setNetworkDiagnostics([]);
     setUpdateInfo(undefined);
     setWebconsoleUrl("");
     setWebconsoleFrameVersion((version) => version + 1);
@@ -545,8 +541,11 @@ export function useAppController() {
   }
 
   async function checkShellUpdate() {
-    const info = await runAction("update", gsdeskApi.checkShellUpdate);
-    if (info) setUpdateInfo(info);
+    const info = await runAction<UpdateInfo>("update", gsdeskApi.checkShellUpdate);
+    if (info) {
+      setUpdateInfo(info);
+      rememberShellUpdateAutoCheck();
+    }
   }
 
   async function installShellUpdate() {
@@ -556,15 +555,24 @@ export function useAppController() {
     return true;
   }
 
-  async function exportDiagnostics() {
-    return runAction("diagnostics", gsdeskApi.exportDiagnostics, "诊断包已导出");
-  }
-
   async function openPath(key: string) {
     try {
       await gsdeskApi.openPath(key);
     } catch (error) {
       message.error(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function selectDirectory(defaultPath?: string) {
+    try {
+      const selected = await gsdeskApi.selectDirectory(defaultPath);
+      if (typeof selected === "string" && selected.trim()) {
+        return selected;
+      }
+      return undefined;
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : String(error));
+      return undefined;
     }
   }
 
@@ -657,6 +665,8 @@ export function useAppController() {
   useEffect(() => {
     if (!appState || shellUpdateAutoChecked.current || !appState.settings.autoCheckUpdate) return;
     shellUpdateAutoChecked.current = true;
+    if (!shouldRunShellUpdateAutoCheck()) return;
+    rememberShellUpdateAutoCheck();
     gsdeskApi
       .checkShellUpdate()
       .then((info) => {
@@ -679,7 +689,6 @@ export function useAppController() {
     setupRunning,
     sourceResults,
     mirrorResults,
-    networkDiagnostics,
     updateInfo,
     webconsoleUrl,
     webconsoleFrameVersion,
@@ -691,9 +700,9 @@ export function useAppController() {
     refreshState,
     probeSources,
     checkMirrors,
-    testNetworkTargets,
     initRuntime,
     bootstrapUv,
+    installPlaywright,
     repairRuntime,
     clearOccupiedPort,
     coreUpdate,
@@ -714,8 +723,8 @@ export function useAppController() {
     runFirstSetup,
     checkShellUpdate,
     installShellUpdate,
-    exportDiagnostics,
     openPath,
+    selectDirectory,
   };
 }
 
@@ -734,13 +743,33 @@ function readInstallGuideSeen() {
   }
 }
 
+function shouldRunShellUpdateAutoCheck(now = Date.now()) {
+  try {
+    const raw = window.localStorage.getItem(SHELL_UPDATE_LAST_AUTO_CHECK_KEY);
+    if (raw === null) return true;
+    const previous = Number(raw);
+    if (!Number.isFinite(previous)) return true;
+    return now - previous >= SHELL_UPDATE_AUTO_CHECK_INTERVAL_MS;
+  } catch {
+    return true;
+  }
+}
+
+function rememberShellUpdateAutoCheck(now = Date.now()) {
+  try {
+    window.localStorage.setItem(SHELL_UPDATE_LAST_AUTO_CHECK_KEY, String(now));
+  } catch {
+    // localStorage 不可用时只影响自动检查节流，手动检查不受影响。
+  }
+}
+
 function stripStateLogs(state: AppState): AppState {
   if (!state.recentLogs.length) return state;
   return { ...state, recentLogs: [] };
 }
 
 function shouldDisplayLogs(activeKey: AppSectionKey) {
-  return activeKey === "overview" || activeKey === "logs" || activeKey.startsWith("diagnostics_");
+  return activeKey === "overview" || activeKey === "logs" || activeKey === "environment_runtime";
 }
 
 function shouldRefreshStateForLog(entry: LogEntry) {
@@ -777,10 +806,6 @@ function isMirrorCheckResults(value: unknown): value is MirrorCheckResult[] {
   return Array.isArray(value) && value.every(isMirrorCheckResult);
 }
 
-function isNetworkDiagnosticResults(value: unknown): value is NetworkDiagnosticResult[] {
-  return Array.isArray(value) && value.every(isNetworkDiagnosticResult);
-}
-
 function isSourceProbeResult(value: unknown): value is SourceProbeResult {
   return (
     isObjectRecord(value) &&
@@ -794,16 +819,6 @@ function isSourceProbeResult(value: unknown): value is SourceProbeResult {
 function isMirrorCheckResult(value: unknown): value is MirrorCheckResult {
   return (
     isObjectRecord(value) && typeof value.name === "string" && typeof value.url === "string" && typeof value.ok === "boolean"
-  );
-}
-
-function isNetworkDiagnosticResult(value: unknown): value is NetworkDiagnosticResult {
-  return (
-    isObjectRecord(value) &&
-    typeof value.id === "string" &&
-    typeof value.label === "string" &&
-    typeof value.target === "string" &&
-    typeof value.ok === "boolean"
   );
 }
 

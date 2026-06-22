@@ -126,6 +126,10 @@ mod tests {
                 .join("runtime/tools/uv/Scripts/uv.exe")
                 .to_string_lossy()
                 .to_string(),
+            playwright_browsers_dir: root
+                .join("runtime/playwright/browsers")
+                .to_string_lossy()
+                .to_string(),
             logs_dir: root.join("logs").to_string_lossy().to_string(),
             diagnostics_dir: root.join("diagnostics").to_string_lossy().to_string(),
             backups_dir: root.join("runtime/backups").to_string_lossy().to_string(),

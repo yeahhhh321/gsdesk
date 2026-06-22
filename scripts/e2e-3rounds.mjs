@@ -104,11 +104,11 @@ function assertNoGbkEncodingNoise() {
 
 function runtimeLogRoots() {
   if (process.platform === "win32") {
-    const base = process.env.APPDATA ? path.join(process.env.APPDATA, "com.yeahhhh321.gsdesk") : "";
+    const base = process.env.APPDATA ? path.join(process.env.APPDATA, "com.core.gsdesk") : "";
     return [path.join(base, "logs"), path.join(base, "runtime", "core", "gsuid_core", "data", "logs")];
   }
   if (process.platform === "darwin") {
-    const base = path.join(process.env.HOME || "", "Library", "Application Support", "com.yeahhhh321.gsdesk");
+    const base = path.join(process.env.HOME || "", "Library", "Application Support", "com.core.gsdesk");
     return [path.join(base, "logs"), path.join(base, "runtime", "core", "gsuid_core", "data", "logs")];
   }
   return [];

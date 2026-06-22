@@ -1,6 +1,6 @@
-import { App as AntdApp, Button, Dropdown, Space, Table, Tag } from "antd";
+import { Alert, App as AntdApp, Button, Dropdown, Space, Table, Tag } from "antd";
 import type { ColumnsType } from "antd/es/table";
-import { DownloadCloud, MoreHorizontal, RefreshCcw, RotateCcw, Trash2, Wrench } from "lucide-react";
+import { AlertTriangle, CheckCircle2, DownloadCloud, MoreHorizontal, RefreshCcw, RotateCcw, Trash2, Wrench } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { gsdeskApi } from "../api";
 import { findGsuidCore } from "../serviceIds";
@@ -9,16 +9,21 @@ import { WidePanel } from "../ui/pageTabs";
 import { PanelHeader, SectionActions } from "../ui/primitives";
 import { isBeginnerMode } from "../ui/userMode";
 import type { AppState, CoreCommitEntry, CoreUpdateResult, TaskRecord } from "../types";
+import type { LogEntry, UpdateInfo } from "../types";
+import { buildLogFailureSummary, buildTroubleshootingItems, severityColor, severityLabel } from "./diagnosticsRules";
 import { createTaskColumns, preflightColumns } from "./environmentTables";
 
-export type EnvironmentSection = "runtime" | "repair" | "update" | "data" | "tasks";
+export type EnvironmentSection = "workbench" | "core" | "tasks";
 
 interface EnvironmentPageProps {
   section: EnvironmentSection;
   appState: AppState;
+  logs: LogEntry[];
+  updateInfo?: UpdateInfo;
   loadingAction?: string;
   onInitRuntime: () => void;
   onBootstrapUv: () => void;
+  onInstallPlaywright: () => void;
   onRepairRuntime: (action: "sync_deps" | "rebuild_venv" | "reclone_core" | "clear_uv_cache") => void;
   onClearOccupiedPort: () => void;
   onCoreUpdate: (
@@ -37,9 +42,12 @@ interface EnvironmentPageProps {
 export default function EnvironmentPage({
   section,
   appState,
+  logs,
+  updateInfo,
   loadingAction,
   onInitRuntime,
   onBootstrapUv,
+  onInstallPlaywright,
   onRepairRuntime,
   onClearOccupiedPort,
   onCoreUpdate,
@@ -55,6 +63,8 @@ export default function EnvironmentPage({
   const [commitListState, setCommitListState] = useState<"idle" | "loading" | "loaded">("idle");
   const beginnerMode = isBeginnerMode(appState.settings);
   const core = findGsuidCore(appState.services);
+  const troubleshootingItems = buildTroubleshootingItems(appState, updateInfo);
+  const logFailureSummary = buildLogFailureSummary(logs);
   const taskColumns = useMemo(
     () => createTaskColumns({ loadingAction, onCancelTask, onRetryTask }),
     [loadingAction, onCancelTask, onRetryTask],
@@ -114,7 +124,7 @@ export default function EnvironmentPage({
   );
 
   useEffect(() => {
-    if (section !== "update" || commitListState !== "idle") return;
+    if (section !== "core" || commitListState !== "idle") return;
     const timer = window.setTimeout(() => {
       void refreshCoreCommits(false);
     }, 100);
@@ -190,7 +200,7 @@ export default function EnvironmentPage({
     modal.confirm({
       title: "清理所有 GSDesk 本机数据",
       content:
-        "这会先停止 Core，然后删除本机 Core 源码、data/config/plugins、venv、uv cache、Python、日志、诊断包、备份和 settings.json。操作不可撤销。",
+        "这会先停止 Core，然后删除本机 Core 源码、data/config/plugins、venv、uv cache、Python、日志、旧诊断包、备份和 settings.json。操作不可撤销。",
       okText: "清理所有数据",
       okButtonProps: { danger: true },
       cancelText: "取消",
@@ -211,157 +221,221 @@ export default function EnvironmentPage({
   return <section className="page-grid">{renderSection()}</section>;
 
   function renderSection() {
-    if (section === "runtime") {
+    if (section === "core") {
       return (
-        <WidePanel>
-          <PanelHeader
-            title="环境预检"
-            description="只查看当前阻断项；修复动作在运行时修复页处理"
-            actions={
-              <Button icon={<RefreshCcw size={16} />} onClick={onRefreshState}>
-                重新检测
-              </Button>
-            }
-          />
-          {beginnerMode ? (
-            <BeginnerPreflight checks={appState.preflightChecks} />
-          ) : (
-            <Table rowKey="id" columns={preflightColumns} dataSource={appState.preflightChecks} pagination={false} size="small" />
-          )}
-        </WidePanel>
+        <>
+          {renderCoreUpdatePanel()}
+          {renderRuntimeDataPanel()}
+        </>
       );
     }
+    if (section === "tasks") return renderTaskPanel();
 
-    if (section === "repair") {
-      return (
-        <WidePanel>
-          <PanelHeader
-            title="运行时修复"
-            description={`uv ${
-              appState.toolchain.uvDetected
-                ? displayText(appState.toolchain.uvVersion, "可用")
-                : `未安装，目标 ${appState.toolchain.uvBootstrapTarget}`
-            } / Git ${
+    return (
+      <>
+        {renderPreflightPanel()}
+        {renderRepairPanel()}
+        {renderFailurePanel()}
+      </>
+    );
+  }
+
+  function renderPreflightPanel() {
+    return (
+      <WidePanel>
+        <PanelHeader
+          title="环境检测"
+          description="系统、工具链、端口、权限、磁盘和运行时阻断项"
+          actions={
+            <Button icon={<RefreshCcw size={16} />} onClick={onRefreshState}>
+              重新检测
+            </Button>
+          }
+        />
+        {beginnerMode ? (
+          <BeginnerPreflight checks={appState.preflightChecks} />
+        ) : (
+          <Table rowKey="id" columns={preflightColumns} dataSource={appState.preflightChecks} pagination={false} size="small" />
+        )}
+      </WidePanel>
+    );
+  }
+
+  function renderRepairPanel() {
+    return (
+      <WidePanel>
+        <PanelHeader
+          title="运行时修复"
+          description={`uv ${
+            appState.toolchain.uvDetected
+              ? displayText(appState.toolchain.uvVersion, "可用")
+              : `未安装，目标 ${appState.toolchain.uvBootstrapTarget}`
+          } / Git ${
+            appState.toolchain.gitDetected
+              ? gitSourceText(appState.toolchain.gitSource)
+              : displayText(appState.toolchain.gitError, "不可用")
+          } / Python ${appState.toolchain.bundledPythonAvailable ? "可用" : "不可用"}`}
+        />
+        <div className="settings-summary-grid">
+          <SummaryItem
+            label="源码工具"
+            value={appState.toolchain.gitDetected ? "可用" : "不可用"}
+            detail={
               appState.toolchain.gitDetected
                 ? gitSourceText(appState.toolchain.gitSource)
-                : displayText(appState.toolchain.gitError, "不可用")
-            } / Python ${appState.toolchain.bundledPythonAvailable ? "可用" : "不可用"}`}
+                : displayText(appState.toolchain.gitError)
+            }
           />
-          <div className="settings-summary-grid">
-            <SummaryItem
-              label="源码工具"
-              value={appState.toolchain.gitDetected ? "可用" : "不可用"}
-              detail={
-                appState.toolchain.gitDetected
-                  ? gitSourceText(appState.toolchain.gitSource)
-                  : displayText(appState.toolchain.gitError)
-              }
-            />
-            <SummaryItem
-              label="uv"
-              value={appState.toolchain.uvDetected ? "可用" : "待创建"}
-              detail={
-                appState.toolchain.uvDetected ? displayText(appState.toolchain.uvVersion) : appState.toolchain.uvBootstrapTarget
-              }
-            />
-            <SummaryItem label="内置 Python" value={appState.toolchain.bundledPythonAvailable ? "可用" : "不可用"} />
-          </div>
-          <SectionActions>
-            {(!beginnerMode || !appState.toolchain.uvDetected) && (
-              <Button
-                icon={<DownloadCloud size={16} />}
-                loading={loadingAction === "bootstrap_uv"}
-                disabled={!appState.toolchain.uvBootstrapSupported}
-                onClick={onBootstrapUv}
-              >
-                安装/更新 uv
-              </Button>
-            )}
-            <Button type="primary" icon={<Wrench size={16} />} loading={loadingAction === "init"} onClick={onInitRuntime}>
-              {beginnerMode ? "一键准备环境" : "重新初始化"}
-            </Button>
+          <SummaryItem
+            label="uv"
+            value={appState.toolchain.uvDetected ? "可用" : "待创建"}
+            detail={
+              appState.toolchain.uvDetected ? displayText(appState.toolchain.uvVersion) : appState.toolchain.uvBootstrapTarget
+            }
+          />
+          <SummaryItem label="内置 Python" value={appState.toolchain.bundledPythonAvailable ? "可用" : "不可用"} />
+          <SummaryItem
+            label="Playwright"
+            value={appState.toolchain.playwrightDetected ? "已安装" : "待安装"}
+            detail={
+              appState.toolchain.playwrightDetected
+                ? appState.toolchain.playwrightBrowsersPath
+                : displayText(appState.toolchain.playwrightError, appState.toolchain.playwrightBrowsersPath)
+            }
+          />
+        </div>
+        <SectionActions>
+          {(!beginnerMode || !appState.toolchain.uvDetected) && (
             <Button
-              icon={<RotateCcw size={16} />}
-              loading={loadingAction === "repair_sync_deps"}
-              onClick={() => onRepairRuntime("sync_deps")}
+              icon={<DownloadCloud size={16} />}
+              loading={loadingAction === "bootstrap_uv"}
+              disabled={!appState.toolchain.uvBootstrapSupported}
+              onClick={onBootstrapUv}
             >
-              同步依赖
+              安装/更新 uv
             </Button>
-            {!beginnerMode && (
-              <Dropdown
-                trigger={["click"]}
-                menu={{
-                  items: [
-                    { key: "clear_uv_cache", label: "清理 uv cache", icon: <Trash2 size={14} /> },
-                    { key: "rebuild_venv", label: "重建 venv", icon: <RotateCcw size={14} /> },
-                    {
-                      key: "clear_port",
-                      label: `强杀端口 ${portForCleanup} 占用`,
-                      icon: <Trash2 size={14} />,
-                      danger: true,
-                    },
-                    { key: "reclone_core", label: "重新 clone Core", icon: <RotateCcw size={14} />, danger: true },
-                  ],
-                  onClick: ({ key }: { key: string }) => runAdvancedRepair(key),
-                }}
-              >
-                <Button icon={<MoreHorizontal size={16} />} loading={advancedRepairLoading}>
-                  高级修复
-                </Button>
-              </Dropdown>
-            )}
-          </SectionActions>
-        </WidePanel>
-      );
-    }
+          )}
+          <Button
+            icon={<DownloadCloud size={16} />}
+            loading={loadingAction === "install_playwright"}
+            disabled={!appState.toolchain.uvDetected}
+            onClick={onInstallPlaywright}
+          >
+            安装 Playwright
+          </Button>
+          <Button type="primary" icon={<Wrench size={16} />} loading={loadingAction === "init"} onClick={onInitRuntime}>
+            {beginnerMode ? "一键准备环境" : "重新初始化"}
+          </Button>
+          <Button
+            icon={<RotateCcw size={16} />}
+            loading={loadingAction === "repair_sync_deps"}
+            onClick={() => onRepairRuntime("sync_deps")}
+          >
+            同步依赖
+          </Button>
+          {!beginnerMode && (
+            <Dropdown
+              trigger={["click"]}
+              menu={{
+                items: [
+                  { key: "clear_uv_cache", label: "清理 uv cache", icon: <Trash2 size={14} /> },
+                  { key: "rebuild_venv", label: "重建 venv", icon: <RotateCcw size={14} /> },
+                  {
+                    key: "clear_port",
+                    label: `强杀端口 ${portForCleanup} 占用`,
+                    icon: <Trash2 size={14} />,
+                    danger: true,
+                  },
+                  { key: "reclone_core", label: "重新 clone Core", icon: <RotateCcw size={14} />, danger: true },
+                ],
+                onClick: ({ key }: { key: string }) => runAdvancedRepair(key),
+              }}
+            >
+              <Button icon={<MoreHorizontal size={16} />} loading={advancedRepairLoading}>
+                高级修复
+              </Button>
+            </Dropdown>
+          )}
+        </SectionActions>
+      </WidePanel>
+    );
+  }
 
-    if (section === "update") {
-      if (beginnerMode) {
-        return (
-          <WidePanel>
-            <PanelHeader
-              title="Core 更新"
-              description="小白模式只保留检查和更新到推荐版本；版本回滚和指定 commit 在高级模式显示"
-            />
-            <div className="settings-summary-grid">
-              <SummaryItem label="当前 commit" value={displayText(core?.currentCommit, "-")} />
-              <SummaryItem label="当前 tag" value={displayText(core?.currentTag, "-")} />
-              <SummaryItem label="更新策略" value="latest 推荐版本" detail="更新成功后 Core 会自动重启" />
+  function renderFailurePanel() {
+    return (
+      <WidePanel>
+        <PanelHeader title="故障摘要" description="当前建议和最近错误段" />
+        <div className="troubleshooting-list">
+          {troubleshootingItems.map((item) => (
+            <div className="troubleshooting-item" key={item.key}>
+              <div className={`troubleshooting-icon ${item.severity}`}>
+                {item.severity === "ok" ? (
+                  <CheckCircle2 size={18} />
+                ) : item.severity === "block" ? (
+                  <AlertTriangle size={18} />
+                ) : (
+                  <Wrench size={18} />
+                )}
+              </div>
+              <div>
+                <div className="troubleshooting-title">
+                  <span>{item.title}</span>
+                  <Tag color={severityColor(item.severity)}>{severityLabel(item.severity)}</Tag>
+                </div>
+                <p>{item.detail}</p>
+                {item.action && <strong>{item.action}</strong>}
+              </div>
             </div>
-            <SectionActions>
-              <Button
-                icon={<RefreshCcw size={16} />}
-                loading={loadingAction === "core_check"}
-                onClick={() => onCoreUpdate("check", "latest")}
-              >
-                检查更新
-              </Button>
-              <Button
-                type="primary"
-                icon={<RotateCcw size={16} />}
-                loading={loadingAction === "core_update"}
-                onClick={() => onCoreUpdate("update", "latest")}
-              >
-                更新 Core
-              </Button>
-            </SectionActions>
-          </WidePanel>
-        );
-      }
+          ))}
+        </div>
+        {logFailureSummary ? (
+          <div className="failure-summary compact-failure-summary">
+            <Alert type="warning" showIcon title={logFailureSummary.title} description={logFailureSummary.explanation} />
+            <div className="failure-context" data-testid="failure-context">
+              {logFailureSummary.context.map((line, index) => (
+                <code key={`${index}-${line}`}>{line}</code>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <Alert
+            className="spaced"
+            type="success"
+            showIcon
+            title="未发现最近错误段"
+            description="当前缓存日志里没有 traceback、异常、失败任务输出或错误级别日志。"
+          />
+        )}
+      </WidePanel>
+    );
+  }
 
+  function renderTaskPanel() {
+    return (
+      <WidePanel>
+        <PanelHeader title="操作记录" description="初始化、启动、停止、修复和更新动作的阶段和耗时" />
+        <Table rowKey="id" columns={taskColumns} dataSource={appState.taskHistory} pagination={false} size="small" />
+      </WidePanel>
+    );
+  }
+
+  function renderCoreUpdatePanel() {
+    if (beginnerMode) {
       return (
         <WidePanel>
-          <PanelHeader
-            title="Core 更新与回滚"
-            description="更新前记录回滚点；仅自动清理 uv.lock 这类更新噪音；Core 运行中会先停止并在成功后自动重启"
-          />
+          <PanelHeader title="Core 更新" description="小白模式只保留检查和更新到推荐版本；版本回滚和指定 commit 在高级模式显示" />
+          <div className="settings-summary-grid">
+            <SummaryItem label="当前 commit" value={displayText(core?.currentCommit, "-")} />
+            <SummaryItem label="当前 tag" value={displayText(core?.currentTag, "-")} />
+            <SummaryItem label="更新策略" value="latest 推荐版本" detail="更新成功后 Core 会自动重启" />
+          </div>
           <SectionActions>
             <Button
               icon={<RefreshCcw size={16} />}
               loading={loadingAction === "core_check"}
               onClick={() => onCoreUpdate("check", "latest")}
             >
-              检查 latest
+              检查更新
             </Button>
             <Button
               type="primary"
@@ -369,85 +443,7 @@ export default function EnvironmentPage({
               loading={loadingAction === "core_update"}
               onClick={() => onCoreUpdate("update", "latest")}
             >
-              更新 latest
-            </Button>
-            <Button
-              icon={<RefreshCcw size={16} />}
-              loading={loadingAction === "core_list_commits" || commitListState === "loading"}
-              onClick={() => refreshCoreCommits()}
-            >
-              刷新 commit 列表
-            </Button>
-            <Dropdown
-              trigger={["click"]}
-              menu={{
-                items: [
-                  { key: "clean", label: "清理更新差异", icon: <Trash2 size={14} /> },
-                  { key: "stable", label: "切到 stable", icon: <RotateCcw size={14} /> },
-                  { key: "dev", label: "更新 dev", icon: <RotateCcw size={14} /> },
-                ],
-                onClick: ({ key }: { key: string }) => runCoreUpdateMenu(key),
-              }}
-            >
-              <Button
-                icon={<MoreHorizontal size={16} />}
-                loading={["core_clean", "core_update"].includes(displayText(loadingAction, ""))}
-              >
-                更多更新操作
-              </Button>
-            </Dropdown>
-          </SectionActions>
-          <Table
-            rowKey="commit"
-            columns={commitColumns}
-            dataSource={coreCommits}
-            pagination={false}
-            size="small"
-            loading={commitListState === "loading" || loadingAction === "core_list_commits"}
-            scroll={{ y: 360 }}
-          />
-        </WidePanel>
-      );
-    }
-
-    if (section === "data") {
-      if (beginnerMode) {
-        return (
-          <WidePanel>
-            <PanelHeader title="运行时备份" description="导出当前 Core 数据、配置和日志快照" />
-            <SectionActions>
-              <Button
-                icon={<DownloadCloud size={16} />}
-                loading={loadingAction === "runtime_backup"}
-                onClick={onCreateRuntimeBackup}
-              >
-                导出备份
-              </Button>
-            </SectionActions>
-          </WidePanel>
-        );
-      }
-
-      return (
-        <WidePanel>
-          <PanelHeader title="运行时备份" description="导出、恢复或清理 GSDesk 运行时数据" />
-          <SectionActions>
-            <Button
-              icon={<DownloadCloud size={16} />}
-              loading={loadingAction === "runtime_backup"}
-              onClick={onCreateRuntimeBackup}
-            >
-              导出备份
-            </Button>
-            <Button
-              icon={<RotateCcw size={16} />}
-              loading={loadingAction === "runtime_restore"}
-              onClick={confirmRestoreRuntimeBackup}
-            >
-              恢复备份
-            </Button>
-            <Button danger icon={<Trash2 size={16} />} loading={loadingAction === "clear_app_data"} onClick={confirmClearAppData}>
-              清理所有数据
+              更新 Core
             </Button>
           </SectionActions>
         </WidePanel>
@@ -456,8 +452,101 @@ export default function EnvironmentPage({
 
     return (
       <WidePanel>
-        <PanelHeader title="任务历史" description="初始化、启动、停止、修复动作的阶段和耗时" />
-        <Table rowKey="id" columns={taskColumns} dataSource={appState.taskHistory} pagination={false} size="small" />
+        <PanelHeader
+          title="Core 更新与回滚"
+          description="更新前记录回滚点；仅自动清理 uv.lock 这类更新噪音；Core 运行中会先停止并在成功后自动重启"
+        />
+        <SectionActions>
+          <Button
+            icon={<RefreshCcw size={16} />}
+            loading={loadingAction === "core_check"}
+            onClick={() => onCoreUpdate("check", "latest")}
+          >
+            检查 latest
+          </Button>
+          <Button
+            type="primary"
+            icon={<RotateCcw size={16} />}
+            loading={loadingAction === "core_update"}
+            onClick={() => onCoreUpdate("update", "latest")}
+          >
+            更新 latest
+          </Button>
+          <Button
+            icon={<RefreshCcw size={16} />}
+            loading={loadingAction === "core_list_commits" || commitListState === "loading"}
+            onClick={() => refreshCoreCommits()}
+          >
+            刷新 commit 列表
+          </Button>
+          <Dropdown
+            trigger={["click"]}
+            menu={{
+              items: [
+                { key: "clean", label: "清理更新差异", icon: <Trash2 size={14} /> },
+                { key: "stable", label: "切到 stable", icon: <RotateCcw size={14} /> },
+                { key: "dev", label: "更新 dev", icon: <RotateCcw size={14} /> },
+              ],
+              onClick: ({ key }: { key: string }) => runCoreUpdateMenu(key),
+            }}
+          >
+            <Button
+              icon={<MoreHorizontal size={16} />}
+              loading={["core_clean", "core_update"].includes(displayText(loadingAction, ""))}
+            >
+              更多更新操作
+            </Button>
+          </Dropdown>
+        </SectionActions>
+        <Table
+          rowKey="commit"
+          columns={commitColumns}
+          dataSource={coreCommits}
+          pagination={false}
+          size="small"
+          loading={commitListState === "loading" || loadingAction === "core_list_commits"}
+          scroll={{ y: 360 }}
+        />
+      </WidePanel>
+    );
+  }
+
+  function renderRuntimeDataPanel() {
+    if (beginnerMode) {
+      return (
+        <WidePanel>
+          <PanelHeader title="运行时备份" description="导出当前 Core 数据、配置和日志快照" />
+          <SectionActions>
+            <Button
+              icon={<DownloadCloud size={16} />}
+              loading={loadingAction === "runtime_backup"}
+              onClick={onCreateRuntimeBackup}
+            >
+              导出备份
+            </Button>
+          </SectionActions>
+        </WidePanel>
+      );
+    }
+
+    return (
+      <WidePanel>
+        <PanelHeader title="运行时备份" description="导出、恢复或清理 GSDesk 运行时数据" />
+        <SectionActions>
+          <Button icon={<DownloadCloud size={16} />} loading={loadingAction === "runtime_backup"} onClick={onCreateRuntimeBackup}>
+            导出备份
+          </Button>
+          <Button
+            icon={<RotateCcw size={16} />}
+            loading={loadingAction === "runtime_restore"}
+            onClick={confirmRestoreRuntimeBackup}
+          >
+            恢复备份
+          </Button>
+          <Button danger icon={<Trash2 size={16} />} loading={loadingAction === "clear_app_data"} onClick={confirmClearAppData}>
+            清理所有数据
+          </Button>
+        </SectionActions>
       </WidePanel>
     );
   }

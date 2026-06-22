@@ -3,7 +3,6 @@ import type {
   CoreUpdateResult,
   LogEntry,
   MirrorCheckResult,
-  NetworkDiagnosticResult,
   RuntimeBackupResult,
   RuntimeRestoreResult,
   Settings,
@@ -26,8 +25,9 @@ const previewState: AppState = {
     customCoreDir: "",
     pypiIndexMode: "auto",
     pypiIndexUrl: "https://pypi.org/simple/",
-    preferredCorePort: null,
-    closeCoreOnExit: true,
+    playwrightDownloadHost: "",
+    preferredCorePort: 8765,
+    closeCoreOnExit: false,
     hideToTrayOnClose: true,
     autoCheckUpdate: true,
     installGuideCompleted: false,
@@ -48,6 +48,7 @@ const previewState: AppState = {
     uvCacheDir: `${PREVIEW_ROOT}/runtime/uv/cache`,
     uvPythonDir: `${PREVIEW_ROOT}/runtime/uv/python`,
     uvExecutable: `${PREVIEW_ROOT}/runtime/tools/uv/Scripts/uv.exe`,
+    playwrightBrowsersDir: `${PREVIEW_ROOT}/runtime/playwright/browsers`,
     logsDir: `${PREVIEW_ROOT}/logs`,
     diagnosticsDir: `${PREVIEW_ROOT}/diagnostics`,
     backupsDir: `${PREVIEW_ROOT}/runtime/backups`,
@@ -65,6 +66,9 @@ const previewState: AppState = {
     bundledPythonAvailable: true,
     bundledPythonPath: `${PREVIEW_ROOT}/resources/runtime-assets/python`,
     uvError: "未检测到 uv",
+    playwrightDetected: false,
+    playwrightBrowsersPath: `${PREVIEW_ROOT}/runtime/playwright/browsers`,
+    playwrightError: "未安装 Playwright 浏览器",
     gitDetected: true,
     gitSource: "bundle",
     gitPath: `${PREVIEW_ROOT}/resources/runtime-assets/git/cmd/git.exe`,
@@ -97,7 +101,7 @@ const previewState: AppState = {
     { id: "os", label: "系统", status: "ok", detail: "windows / x86_64" },
     { id: "git", label: "源码工具", status: "ok", detail: "Git 可用: git version 2.51.2.windows.1 (内置)" },
     { id: "uv", label: "uv", status: "block", detail: "未检测到 uv", action: "安装 uv 或使用正式发行包" },
-    { id: "port", label: "默认端口", status: "ok", detail: "8765 可用；固定端口未设置" },
+    { id: "port", label: "固定端口", status: "ok", detail: "8765 可用" },
     { id: "core_repo", label: "Core 源码", status: "warn", detail: "尚未初始化 Core 源码", action: "运行首次安装引导" },
   ],
   taskHistory: [
@@ -173,6 +177,9 @@ export async function previewCommand<T>(name: string, args?: Record<string, unkn
       uvBootstrapTarget: previewState.paths.uvExecutable,
       bundledPythonAvailable: true,
       bundledPythonPath: `${PREVIEW_ROOT}/resources/runtime-assets/python`,
+      playwrightDetected: previewState.toolchain.playwrightDetected,
+      playwrightBrowsersPath: previewState.paths.playwrightBrowsersDir,
+      playwrightError: previewState.toolchain.playwrightError,
       gitDetected: true,
       gitSource: "bundle",
       gitPath: `${PREVIEW_ROOT}/resources/runtime-assets/git/cmd/git.exe`,
@@ -193,6 +200,28 @@ export async function previewCommand<T>(name: string, args?: Record<string, unkn
         startedAt: new Date(Date.now() - 1500).toISOString(),
         endedAt: new Date().toISOString(),
         elapsedMs: 1500,
+      },
+      ...previewState.taskHistory,
+    ];
+    return previewStateSnapshot() as T;
+  }
+  if (name === "install_playwright") {
+    previewState.toolchain = {
+      ...previewState.toolchain,
+      playwrightDetected: true,
+      playwrightBrowsersPath: previewState.paths.playwrightBrowsersDir,
+      playwrightError: undefined,
+    };
+    previewState.taskHistory = [
+      {
+        id: previewState.taskHistory.length + 1,
+        name: "安装 Playwright",
+        status: "success",
+        stage: "done",
+        message: "Playwright Chromium 已安装到隔离目录",
+        startedAt: new Date(Date.now() - 2200).toISOString(),
+        endedAt: new Date().toISOString(),
+        elapsedMs: 2200,
       },
       ...previewState.taskHistory,
     ];
@@ -384,7 +413,7 @@ export async function previewCommand<T>(name: string, args?: Record<string, unkn
       ...previewState.settings,
       beginnerMode: true,
       installGuideCompleted: false,
-      preferredCorePort: null,
+      preferredCorePort: 8765,
       customCoreDir: "",
     };
     applyPreviewPaths();
@@ -459,14 +488,6 @@ export async function previewCommand<T>(name: string, args?: Record<string, unkn
       { name: "官方", url: "https://pypi.org/simple/", ok: true, latencyMs: 280, speedMbps: 2.4 },
     ] satisfies MirrorCheckResult[] as T;
   }
-  if (name === "test_network_targets") {
-    return [
-      { id: "github", label: "GitHub", target: "https://github.com/Genshin-bots/gsuid_core.git", ok: true, latencyMs: 320 },
-      { id: "cnb", label: "CNB 国内镜像", target: "https://cnb.cool/gscore-mirror/gsuid_core.git", ok: true, latencyMs: 118 },
-      { id: "pypi", label: "当前 PyPI 镜像", target: previewState.settings.pypiIndexUrl, ok: true, latencyMs: 96 },
-      { id: "webconsole", label: "本机 WebConsole", target: "Core 未启动", ok: false, error: "Core 尚未启动，无法测试 /app" },
-    ] satisfies NetworkDiagnosticResult[] as T;
-  }
   if (name === "stream_logs") return previewState.recentLogs as T;
   if (name === "open_webconsole") {
     const core = previewState.services[0];
@@ -496,7 +517,6 @@ export async function previewCommand<T>(name: string, args?: Record<string, unkn
       message: "预览数据：壳更新 0.2.0 已安装，正在重启 GSDesk",
     } satisfies UpdateInstallResult as T;
   }
-  if (name === "export_diagnostics") return `${PREVIEW_ROOT}/diagnostics/gsdesk-diagnostics.zip` as T;
   if (name === "open_path") return undefined as T;
   return previewStateSnapshot() as T;
 }
@@ -536,13 +556,13 @@ function createPreviewLogs(count: number): LogEntry[] {
     },
     {
       level: "error",
-      line: 'File "C:\\Users\\echo\\AppData\\Roaming\\com.yeahhhh321.gsdesk\\runtime\\core\\gsuid_core\\gsuid_core\\core.py", line 79, in main',
+      line: 'File "C:\\Users\\echo\\AppData\\Roaming\\com.core.gsdesk\\runtime\\core\\gsuid_core\\gsuid_core\\core.py", line 79, in main',
       message:
-        'File "C:\\Users\\echo\\AppData\\Roaming\\com.yeahhhh321.gsdesk\\runtime\\core\\gsuid_core\\gsuid_core\\core.py", line 79, in main',
+        'File "C:\\Users\\echo\\AppData\\Roaming\\com.core.gsdesk\\runtime\\core\\gsuid_core\\gsuid_core\\core.py", line 79, in main',
       module: "启动失败",
       raw: JSON.stringify({
         event:
-          'File "C:\\Users\\echo\\AppData\\Roaming\\com.yeahhhh321.gsdesk\\runtime\\core\\gsuid_core\\gsuid_core\\core.py", line 79, in main',
+          'File "C:\\Users\\echo\\AppData\\Roaming\\com.core.gsdesk\\runtime\\core\\gsuid_core\\gsuid_core\\core.py", line 79, in main',
         level: "error",
         timestamp: "06-19 10:37:45",
       }),

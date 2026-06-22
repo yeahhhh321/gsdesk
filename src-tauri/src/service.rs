@@ -1476,6 +1476,113 @@ pub fn repair_runtime(
     result
 }
 
+pub fn install_playwright(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    settings: &Settings,
+) -> Result<(), String> {
+    let (_, paths) = app_paths(app)?;
+    let task_id = start_runtime_task(
+        runtime,
+        "安装 Playwright",
+        "prepare",
+        "准备安装 Playwright Python 包和 Chromium 浏览器",
+    );
+    push_system_log(app, runtime, "info", "开始安装 Playwright 到 GSDesk 隔离运行时");
+    let result = install_playwright_steps(app, runtime, settings, &paths, task_id);
+    match &result {
+        Ok(_) => {
+            finish_runtime_task(
+                runtime,
+                task_id,
+                "success",
+                "done",
+                "Playwright Chromium 已安装到隔离目录",
+            );
+            push_system_log(app, runtime, "info", "Playwright Chromium 已安装到隔离目录");
+        }
+        Err(error) => {
+            let mut guard = runtime.lock();
+            finish_task_for_error(&mut guard, task_id, "error", error);
+            drop(guard);
+            let level = if is_task_cancelled_error(error) { "warn" } else { "error" };
+            push_system_log(app, runtime, level, error);
+        }
+    }
+    result
+}
+
+fn install_playwright_steps(
+    app: &AppHandle,
+    runtime: &SharedRuntime,
+    settings: &Settings,
+    paths: &AppPaths,
+    task_id: u64,
+) -> Result<(), String> {
+    let core_dir = PathBuf::from(&paths.core_dir);
+    if !core_dir.join("pyproject.toml").is_file() {
+        return Err(format!(
+            "请先初始化 Core 运行时，再安装 Playwright。缺少: {}",
+            core_dir.display()
+        ));
+    }
+
+    let envs = runtime_env(settings, paths);
+    let uv_program = toolchain::uv_program(app, paths)?;
+    toolchain::ensure_python_runtime(app, paths, &uv_program, &envs, |stage, message| {
+        update_runtime_task(runtime, task_id, stage, message);
+        push_system_log(app, runtime, "info", message);
+    })?;
+
+    update_runtime_task(runtime, task_id, "dependencies", "确认 Core Python 依赖环境");
+    run_logged(
+        app,
+        runtime,
+        &uv_program,
+        &["sync", "--no-dev"],
+        Some(&core_dir),
+        &envs,
+        Duration::from_secs(1200),
+    )?;
+
+    let venv_python = find_venv_python(paths)
+        .ok_or_else(|| format!("Core venv 不完整，未找到 Python: {}", paths.venv_dir))?;
+    let venv_python_text = venv_python.to_string_lossy().to_string();
+
+    update_runtime_task(runtime, task_id, "package", "安装 Playwright Python 包");
+    run_logged(
+        app,
+        runtime,
+        &uv_program,
+        &["pip", "install", "--python", venv_python_text.as_str(), "playwright"],
+        Some(&core_dir),
+        &envs,
+        Duration::from_secs(600),
+    )?;
+
+    fs::create_dir_all(&paths.playwright_browsers_dir)
+        .map_err(|error| format!("创建 Playwright 浏览器目录失败: {error}"))?;
+    update_runtime_task(runtime, task_id, "browsers", "下载 Playwright Chromium 浏览器");
+    run_logged(
+        app,
+        runtime,
+        &venv_python_text,
+        &["-m", "playwright", "install", "chromium"],
+        Some(&core_dir),
+        &envs,
+        Duration::from_secs(1200),
+    )?;
+
+    if !playwright_chromium_installed(&paths.playwright_browsers_dir) {
+        return Err(format!(
+            "Playwright 安装结束但未发现 Chromium 浏览器目录: {}",
+            paths.playwright_browsers_dir
+        ));
+    }
+    update_runtime_task(runtime, task_id, "verify", "Playwright Chromium 已验证");
+    Ok(())
+}
+
 pub fn core_update(
     app: &AppHandle,
     runtime: &SharedRuntime,
@@ -2285,6 +2392,32 @@ fn normalize_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+fn find_venv_python(paths: &AppPaths) -> Option<PathBuf> {
+    let venv = PathBuf::from(&paths.venv_dir);
+    let candidates = if cfg!(windows) {
+        vec![venv.join("Scripts").join("python.exe"), venv.join("python.exe")]
+    } else {
+        vec![venv.join("bin").join("python"), venv.join("bin").join("python3")]
+    };
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn playwright_chromium_installed(path: &str) -> bool {
+    fs::read_dir(path)
+        .ok()
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let path = entry.path();
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("chromium-"))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn resolve_start_port(
     settings: &Settings,
     request: Option<&StartServiceRequest>,
@@ -2304,7 +2437,7 @@ fn resolve_fixed_port(port: u16, label: &str) -> Result<u16, String> {
     }
     if !service_port_available(port) {
         return Err(format!(
-            "{label} {port} 已被占用，请关闭占用进程，或在网络设置里清空固定端口改回自动选择"
+            "{label} {port} 已被占用，请关闭占用进程，或在网络设置里改成其他可用端口"
         ));
     }
     Ok(port)
@@ -2316,6 +2449,8 @@ pub fn runtime_env(settings: &Settings, paths: &crate::models::AppPaths) -> Vec<
     envs.push(("UV_CACHE_DIR".to_string(), paths.uv_cache_dir.clone()));
     envs.push(("UV_PYTHON_INSTALL_DIR".to_string(), paths.uv_python_dir.clone()));
     envs.push(("UV_PYTHON_DOWNLOADS".to_string(), "never".to_string()));
+    envs.push(("PLAYWRIGHT_BROWSERS_PATH".to_string(), paths.playwright_browsers_dir.clone()));
+    envs.push(("PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT".to_string(), "120000".to_string()));
     envs.push(("PYTHONUTF8".to_string(), "1".to_string()));
     envs.push(("PYTHONIOENCODING".to_string(), PYTHON_IO_ENCODING.to_string()));
     envs.push(("PYTHONUNBUFFERED".to_string(), "1".to_string()));
@@ -2925,6 +3060,11 @@ mod tests {
                 .join("uv")
                 .to_string_lossy()
                 .to_string(),
+            playwright_browsers_dir: runtime
+                .join("playwright")
+                .join("browsers")
+                .to_string_lossy()
+                .to_string(),
             logs_dir: runtime.join("logs").to_string_lossy().to_string(),
             diagnostics_dir: runtime.join("diagnostics").to_string_lossy().to_string(),
             backups_dir: runtime.join("backups").to_string_lossy().to_string(),
@@ -3126,6 +3266,7 @@ mod tests {
             uv_cache_dir: "cache".into(),
             uv_python_dir: "py".into(),
             uv_executable: "tools/uv/Scripts/uv.exe".into(),
+            playwright_browsers_dir: "playwright".into(),
             logs_dir: "l".into(),
             diagnostics_dir: "d".into(),
             backups_dir: "b".into(),
@@ -3149,6 +3290,7 @@ mod tests {
             uv_cache_dir: "cache".into(),
             uv_python_dir: "py".into(),
             uv_executable: "tools/uv/Scripts/uv.exe".into(),
+            playwright_browsers_dir: "playwright".into(),
             logs_dir: "l".into(),
             diagnostics_dir: "d".into(),
             backups_dir: "b".into(),

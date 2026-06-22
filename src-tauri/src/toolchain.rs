@@ -25,6 +25,8 @@ pub fn uv_status(app: &AppHandle, paths: &AppPaths) -> ToolchainInfo {
     let uv_bootstrap_supported = bundled_python.is_some();
     let uv = resolve_uv(app, paths);
     let git = resolve_git(app, paths);
+    let playwright_browsers_path = paths.playwright_browsers_dir.clone();
+    let playwright_detected = playwright_browsers_installed(&playwright_browsers_path);
     let bundled_python_path =
         bundled_python.as_ref().map(|path| path.to_string_lossy().to_string());
     let bundled_git_path =
@@ -46,6 +48,10 @@ pub fn uv_status(app: &AppHandle, paths: &AppPaths) -> ToolchainInfo {
         uv_error: uv
             .is_none()
             .then(|| "未检测到 GSDesk 隔离 uv；可使用内置 Python 创建，不修改系统环境".to_string()),
+        playwright_detected,
+        playwright_browsers_path: playwright_browsers_path.clone(),
+        playwright_error: (!playwright_detected)
+            .then(|| format!("未安装 Playwright 浏览器，目标路径: {playwright_browsers_path}")),
         git_detected: git.is_some(),
         git_path: git.as_ref().map(|found| found.program.clone()),
         git_source: git
@@ -57,6 +63,23 @@ pub fn uv_status(app: &AppHandle, paths: &AppPaths) -> ToolchainInfo {
         git_error: git.is_none().then(|| git_missing_message(bundled_git_path.as_deref())),
         bundled_git_path,
     }
+}
+
+fn playwright_browsers_installed(path: &str) -> bool {
+    let dir = Path::new(path);
+    fs::read_dir(dir)
+        .ok()
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let path = entry.path();
+                path.is_dir()
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("chromium-"))
+            })
+        })
+        .unwrap_or(false)
 }
 
 pub fn uv_program(app: &AppHandle, paths: &AppPaths) -> Result<String, String> {

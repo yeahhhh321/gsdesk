@@ -283,6 +283,11 @@ mod tests {
                 .join(crate::paths::uv_executable_name())
                 .to_string_lossy()
                 .to_string(),
+            playwright_browsers_dir: runtime
+                .join("playwright")
+                .join("browsers")
+                .to_string_lossy()
+                .to_string(),
             logs_dir: logs.to_string_lossy().to_string(),
             diagnostics_dir: dir.join("diagnostics").to_string_lossy().to_string(),
             backups_dir: backups.to_string_lossy().to_string(),

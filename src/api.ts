@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { previewCommand } from "./dev/previewApi";
 import { GSUID_CORE_SERVICE_ID } from "./serviceIds";
 import type {
@@ -9,7 +10,6 @@ import type {
   CoreUpdateResult,
   LogEntry,
   MirrorCheckResult,
-  NetworkDiagnosticResult,
   RuntimeBackupResult,
   RuntimeRestoreResult,
   ServiceSnapshot,
@@ -47,7 +47,6 @@ export const gsdeskApi = {
   saveSettings: (settings: Settings) => command<AppState>("save_settings", { settings }),
   probeSources: () => command<SourceProbeResult[]>("probe_sources"),
   checkPypiMirrors: () => command<MirrorCheckResult[]>("check_pypi_mirrors"),
-  testNetworkTargets: () => command<NetworkDiagnosticResult[]>("test_network_targets"),
   initCoreRuntime: () => command<AppState>("init_core_runtime"),
   repairRuntime: (action: "sync_deps" | "rebuild_venv" | "reclone_core" | "clear_uv_cache") =>
     command<AppState>("repair_runtime", { request: { action } }),
@@ -63,6 +62,7 @@ export const gsdeskApi = {
   exportSettings: () => command<SettingsTransferResult>("export_settings"),
   importSettings: () => command<AppState>("import_settings", { request: { path: null } }),
   bootstrapUv: () => command<AppState>("bootstrap_uv"),
+  installPlaywright: () => command<AppState>("install_playwright"),
   cancelCurrentTask: () => command<AppState>("cancel_current_task"),
   startGsuidCore: () =>
     command<ServiceSnapshot>("start_service", {
@@ -71,10 +71,17 @@ export const gsdeskApi = {
   stopGsuidCore: () => command<AppState>("stop_service", { serviceId: GSUID_CORE_SERVICE_ID }),
   openGsuidWebconsole: () => command<{ url: string }>("open_webconsole", { serviceId: GSUID_CORE_SERVICE_ID }),
   openExternalUrl: (url: string) => command<void>("open_external_url", { url }),
-  exportDiagnostics: () => command<string>("export_diagnostics"),
   checkShellUpdate: () => command<UpdateInfo>("check_shell_update"),
   installShellUpdate: () => command<UpdateInstallResult>("install_shell_update"),
   openPath: (key: string) => command<void>("open_path", { key }),
+  selectDirectory: async (defaultPath?: string) => {
+    if (!isTauriRuntime()) {
+      return "D:\\selected\\gsuid_core";
+    }
+    const selected = await openDialog({ directory: true, multiple: false, defaultPath });
+    if (Array.isArray(selected)) return selected[0];
+    return selected;
+  },
 };
 
 export function subscribeLogs(handler: (entry: LogEntry) => void): Promise<() => void> {

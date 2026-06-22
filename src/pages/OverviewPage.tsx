@@ -21,6 +21,7 @@ interface OverviewPageProps {
   onOpenWebconsole: () => void;
   onOpenInstallGuide: (step?: number) => void;
   onOpenEnvironment: () => void;
+  onOpenOperations: () => void;
   onOpenLogs: () => void;
 }
 
@@ -37,6 +38,7 @@ export default function OverviewPage({
   onOpenWebconsole,
   onOpenInstallGuide,
   onOpenEnvironment,
+  onOpenOperations,
   onOpenLogs,
 }: OverviewPageProps) {
   const coreStatus = core?.status ?? "uninitialized";
@@ -49,9 +51,9 @@ export default function OverviewPage({
   const compactPreflight = (actionablePreflight.length ? actionablePreflight : visiblePreflight).slice(0, PREFLIGHT_LIMIT);
   const hiddenPreflightCount = Math.max(visiblePreflight.length - compactPreflight.length, 0);
   const taskHistory = appState?.taskHistory ?? [];
-  const compactTasks = taskHistory.slice(0, TASK_LIMIT);
+  const compactTasks = beginnerMode ? [] : taskHistory.slice(0, TASK_LIMIT);
   const hiddenTaskCount = Math.max(taskHistory.length - compactTasks.length, 0);
-  const portPolicy = appState?.settings.preferredCorePort ? `固定 ${appState.settings.preferredCorePort}` : "自动";
+  const portPolicy = `固定 ${appState?.settings.preferredCorePort ?? 8765}`;
   const settingsItems = appState ? createSettingsItems(appState.settings, appState.toolchain, beginnerMode) : [];
   const lifecycleAction = getLifecycleAction(coreStatus);
   const lifecycleLoading = Boolean(lifecycleAction.loadingKey && loadingAction === lifecycleAction.loadingKey);
@@ -60,12 +62,13 @@ export default function OverviewPage({
     core,
     coreStatus,
     blockingChecks,
-    runningTask: taskHistory.find((task) => task.status === "running"),
-    failedTask: taskHistory.find((task) => task.status === "failed"),
+    runningTask: beginnerMode ? undefined : taskHistory.find((task) => task.status === "running"),
+    failedTask: beginnerMode ? undefined : taskHistory.find((task) => task.status === "failed"),
     onStartCore,
     onOpenWebconsole,
     onOpenInstallGuide,
     onOpenEnvironment,
+    onOpenOperations,
     onOpenLogs,
   });
 
@@ -101,11 +104,13 @@ export default function OverviewPage({
               detail={displayText(core?.currentTag, "无 tag")}
             />
             <OverviewMetric label="工具链" value={toolchainStatus(appState)} detail={toolchainDetail(appState)} />
-            <OverviewMetric
-              label="任务"
-              value={taskStatusSummary(taskHistory)}
-              detail={taskHistory[0] ? taskHistory[0].name : "暂无任务"}
-            />
+            {!beginnerMode && (
+              <OverviewMetric
+                label="任务"
+                value={taskStatusSummary(taskHistory)}
+                detail={taskHistory[0] ? taskHistory[0].name : "暂无任务"}
+              />
+            )}
           </div>
           <SectionActions>
             <Button
@@ -176,33 +181,35 @@ export default function OverviewPage({
         <OverviewInfoGrid items={settingsItems} />
       </div>
 
-      <div className="wide-panel overview-task-panel overview-compact-panel">
-        <PanelHeader
-          title="任务历史"
-          actions={
-            <Button icon={<ListChecks size={16} />} onClick={onOpenEnvironment}>
-              查看
-            </Button>
-          }
-        />
-        <div className="overview-task-list">
-          {compactTasks.map((task) => (
-            <div className="overview-task-item" key={task.id}>
-              <TaskStatusTag status={task.status} />
-              <div>
-                <strong>{task.name}</strong>
-                <small>
-                  {task.stage} · {formatTime(task.startedAt)}
-                </small>
+      {!beginnerMode && (
+        <div className="wide-panel overview-task-panel overview-compact-panel">
+          <PanelHeader
+            title="操作记录"
+            actions={
+              <Button icon={<ListChecks size={16} />} onClick={onOpenOperations}>
+                查看
+              </Button>
+            }
+          />
+          <div className="overview-task-list">
+            {compactTasks.map((task) => (
+              <div className="overview-task-item" key={task.id}>
+                <TaskStatusTag status={task.status} />
+                <div>
+                  <strong>{task.name}</strong>
+                  <small>
+                    {task.stage} · {formatTime(task.startedAt)}
+                  </small>
+                </div>
+                <p>{task.message}</p>
+                <span>{displaySecondsFromMilliseconds(task.elapsedMs, task.status === "running" ? "进行中" : "-")}</span>
               </div>
-              <p>{task.message}</p>
-              <span>{displaySecondsFromMilliseconds(task.elapsedMs, task.status === "running" ? "进行中" : "-")}</span>
-            </div>
-          ))}
-          {!compactTasks.length && <p className="muted-block">暂无任务记录。</p>}
-          {hiddenTaskCount > 0 && <p className="overview-more-line">还有 {hiddenTaskCount} 条任务在任务历史页查看。</p>}
+            ))}
+            {!compactTasks.length && <p className="muted-block">暂无操作记录。</p>}
+            {hiddenTaskCount > 0 && <p className="overview-more-line">还有 {hiddenTaskCount} 条在操作记录里查看。</p>}
+          </div>
         </div>
-      </div>
+      )}
 
       <div className="wide-panel overview-guide-panel overview-compact-panel">
         <PanelHeader
@@ -285,8 +292,8 @@ function createSettingsItems(settings: Settings, toolchain: ToolchainInfo, begin
       { label: "PyPI", value: pypiModeText(settings.pypiIndexMode), detail: displayText(settings.pypiIndexUrl, "自动选择镜像") },
       {
         label: "端口",
-        value: settings.preferredCorePort ? `固定 ${settings.preferredCorePort}` : "自动选择",
-        detail: settings.preferredCorePort ? "高级设置仍在生效" : "默认从 8765 开始",
+        value: `固定 ${settings.preferredCorePort ?? 8765}`,
+        detail: "默认 8765",
       },
       { label: "关闭窗口", value: settings.hideToTrayOnClose ? "隐藏到托盘" : "退出 GSDesk" },
     ];
@@ -302,8 +309,8 @@ function createSettingsItems(settings: Settings, toolchain: ToolchainInfo, begin
     { label: "PyPI", value: pypiModeText(settings.pypiIndexMode), detail: displayText(settings.pypiIndexUrl, "未设置镜像") },
     {
       label: "端口",
-      value: settings.preferredCorePort ? `固定 ${settings.preferredCorePort}` : "自动选择",
-      detail: settings.preferredCorePort ? "启动时严格使用该端口" : "自动选择 8765-8865",
+      value: `固定 ${settings.preferredCorePort ?? 8765}`,
+      detail: "启动时严格使用该端口",
     },
     { label: "代理", value: proxySummary(settings.proxy), detail: "HTTP / HTTPS / ALL / NO_PROXY" },
     {
@@ -421,6 +428,7 @@ function buildOverviewNextAction({
   onOpenWebconsole,
   onOpenInstallGuide,
   onOpenEnvironment,
+  onOpenOperations,
   onOpenLogs,
 }: {
   core?: ServiceSnapshot;
@@ -432,6 +440,7 @@ function buildOverviewNextAction({
   onOpenWebconsole: () => void;
   onOpenInstallGuide: (step?: number) => void;
   onOpenEnvironment: () => void;
+  onOpenOperations: () => void;
   onOpenLogs: () => void;
 }): OverviewNextAction {
   if (runningTask) {
@@ -439,7 +448,7 @@ function buildOverviewNextAction({
       type: "info",
       title: `当前任务：${runningTask.name}`,
       detail: `${runningTask.stage} · ${runningTask.message}`,
-      primary: { label: "查看任务", onClick: onOpenEnvironment },
+      primary: { label: "查看记录", onClick: onOpenOperations },
       primaryIcon: <ListChecks size={14} />,
       secondary: { label: "看日志", onClick: onOpenLogs },
       secondaryIcon: <Terminal size={14} />,
@@ -519,8 +528,8 @@ function buildOverviewNextAction({
   return {
     type: "info",
     title: statusText[coreStatus],
-    detail: "当前状态正在变化；需要排查时先查看任务历史和 Core 日志。",
-    primary: { label: "查看任务", onClick: onOpenEnvironment },
+    detail: "当前状态正在变化；需要排查时先查看操作记录和 Core 日志。",
+    primary: { label: "查看记录", onClick: onOpenOperations },
     primaryIcon: <ListChecks size={14} />,
   };
 }

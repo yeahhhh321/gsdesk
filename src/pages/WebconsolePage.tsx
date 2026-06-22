@@ -160,7 +160,7 @@ function buildWebconsoleEmptyState({
       type: "info",
       emptyText: "Core 已停止",
       title: "启动 Core 后加载 WebConsole",
-      detail: "启动完成后 GSDesk 会检查 /app 是否可访问；端口策略仍按网络设置执行。",
+      detail: "启动完成后 GSDesk 会检查 /app 是否可访问；端口策略仍按设置执行。",
       primary: { label: "启动 Core", icon: <Play size={16} />, onClick: onStartCore, loadingKey: "start" },
     };
   }
@@ -170,7 +170,7 @@ function buildWebconsoleEmptyState({
       type: "info",
       emptyText: statusText[coreStatus],
       title: "正在等待 Core 就绪",
-      detail: "如果长时间没有变化，打开任务历史确认阶段，再查看日志里的启动输出。",
+      detail: "如果长时间没有变化，打开操作记录确认任务阶段，再查看日志里的启动输出。",
       primary: { label: "查看日志", icon: <Terminal size={16} />, onClick: onOpenLogs },
     };
   }

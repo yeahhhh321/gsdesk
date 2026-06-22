@@ -22,6 +22,7 @@ export interface Settings {
   customCoreDir: string;
   pypiIndexMode: "auto" | "manual";
   pypiIndexUrl: string;
+  playwrightDownloadHost: string;
   preferredCorePort?: number | null;
   lastSourceProbeAt?: string;
   lastMirrorCheckAt?: string;
@@ -42,6 +43,7 @@ export interface AppPaths {
   uvCacheDir: string;
   uvPythonDir: string;
   uvExecutable: string;
+  playwrightBrowsersDir: string;
   logsDir: string;
   diagnosticsDir: string;
   backupsDir: string;
@@ -59,6 +61,9 @@ export interface ToolchainInfo {
   bundledPythonAvailable: boolean;
   bundledPythonPath?: string;
   uvError?: string;
+  playwrightDetected: boolean;
+  playwrightBrowsersPath: string;
+  playwrightError?: string;
   gitDetected: boolean;
   gitPath?: string;
   gitSource: "runtime" | "bundle" | "system" | "missing" | string;
@@ -206,15 +211,6 @@ export interface MirrorCheckResult {
   ok: boolean;
   latencyMs?: number;
   speedMbps?: number;
-  error?: string;
-}
-
-export interface NetworkDiagnosticResult {
-  id: string;
-  label: string;
-  target: string;
-  ok: boolean;
-  latencyMs?: number;
   error?: string;
 }
 

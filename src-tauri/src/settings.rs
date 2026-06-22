@@ -8,7 +8,13 @@ use crate::models::{Settings, SettingsTransferResult};
 
 pub fn load_settings(settings_file: &Path) -> Settings {
     match fs::read_to_string(settings_file) {
-        Ok(raw) => serde_json::from_str::<Settings>(&raw).unwrap_or_default(),
+        Ok(raw) => match serde_json::from_str::<Settings>(&raw) {
+            Ok(mut settings) => {
+                apply_settings_defaults(&mut settings);
+                settings
+            }
+            Err(_) => Settings::default(),
+        },
         Err(_) => Settings::default(),
     }
 }
@@ -17,15 +23,31 @@ pub fn save_settings_file(settings_file: &Path, settings: &Settings) -> Result<(
     if let Some(parent) = settings_file.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("创建设置目录失败: {error}"))?;
     }
-    let json = serde_json::to_string_pretty(settings)
+    let mut normalized = settings.clone();
+    apply_settings_defaults(&mut normalized);
+    let json = serde_json::to_string_pretty(&normalized)
         .map_err(|error| format!("序列化设置失败: {error}"))?;
     fs::write(settings_file, json).map_err(|error| format!("写入设置失败: {error}"))
+}
+
+fn apply_settings_defaults(settings: &mut Settings) {
+    if settings.preferred_core_port.is_none() {
+        settings.preferred_core_port = Some(8765);
+    }
 }
 
 pub fn env_from_settings(settings: &Settings) -> Vec<(String, String)> {
     let mut envs = Vec::new();
     if !settings.pypi_index_url.trim().is_empty() {
-        envs.push(("UV_DEFAULT_INDEX".to_string(), settings.pypi_index_url.trim().to_string()));
+        let pypi_index_url = settings.pypi_index_url.trim().to_string();
+        envs.push(("UV_DEFAULT_INDEX".to_string(), pypi_index_url.clone()));
+        envs.push(("PIP_INDEX_URL".to_string(), pypi_index_url));
+    }
+    if !settings.playwright_download_host.trim().is_empty() {
+        envs.push((
+            "PLAYWRIGHT_DOWNLOAD_HOST".to_string(),
+            settings.playwright_download_host.trim().to_string(),
+        ));
     }
     add_proxy_env(&mut envs, "HTTP_PROXY", &settings.proxy.http_proxy);
     add_proxy_env(&mut envs, "http_proxy", &settings.proxy.http_proxy);
@@ -59,6 +81,7 @@ pub fn export_portable_settings(
             "customCoreDir": settings.custom_core_dir,
             "pypiIndexMode": settings.pypi_index_mode,
             "pypiIndexUrl": settings.pypi_index_url,
+            "playwrightDownloadHost": settings.playwright_download_host,
             "preferredCorePort": settings.preferred_core_port,
             "closeCoreOnExit": settings.close_core_on_exit,
             "hideToTrayOnClose": settings.hide_to_tray_on_close,
@@ -125,6 +148,10 @@ pub fn import_portable_settings(
             next.pypi_index_mode = value;
             fields.push("pypiIndexMode".to_string());
         }
+    }
+    if let Some(value) = read_string(settings_value, "playwrightDownloadHost") {
+        next.playwright_download_host = value;
+        fields.push("playwrightDownloadHost".to_string());
     }
     if let Some(value) = settings_value.get("preferredCorePort") {
         if value.is_null() {
@@ -206,6 +233,7 @@ fn portable_setting_fields() -> Vec<String> {
         "customCoreDir",
         "pypiIndexMode",
         "pypiIndexUrl",
+        "playwrightDownloadHost",
         "preferredCorePort",
         "closeCoreOnExit",
         "hideToTrayOnClose",
@@ -256,6 +284,15 @@ mod tests {
         let settings = Settings::default();
         let envs = env_from_settings(&settings);
         assert!(envs.iter().any(|(key, value)| key == "NO_PROXY" && value.contains("127.0.0.1")));
+        assert!(envs
+            .iter()
+            .any(|(key, value)| key == "PIP_INDEX_URL" && value.contains("pypi.org")));
+    }
+
+    #[test]
+    fn default_settings_keep_core_on_exit() {
+        let settings = Settings::default();
+        assert!(!settings.close_core_on_exit);
     }
 
     #[test]
@@ -282,6 +319,8 @@ mod tests {
         settings.proxy.http_proxy = "http://user:secret@127.0.0.1:7890".to_string();
         settings.proxy.no_proxy = "127.0.0.1,localhost".to_string();
         settings.pypi_index_mode = "manual".to_string();
+        settings.playwright_download_host =
+            "https://cdn.npmmirror.com/binaries/playwright".to_string();
         settings.preferred_core_port = Some(8899);
         settings.custom_core_dir = "D:\\gsuid_core".to_string();
 
@@ -289,12 +328,16 @@ mod tests {
         let raw = fs::read_to_string(&result.path).unwrap();
 
         assert!(raw.contains("\"pypiIndexMode\": \"manual\""));
+        assert!(raw.contains(
+            "\"playwrightDownloadHost\": \"https://cdn.npmmirror.com/binaries/playwright\""
+        ));
         assert!(raw.contains("\"beginnerMode\": true"));
         assert!(raw.contains("\"preferredCorePort\": 8899"));
         assert!(raw.contains("\"customCoreDir\": \"D:\\\\gsuid_core\""));
         assert!(raw.contains("127.0.0.1,localhost"));
         assert!(!raw.contains("secret"));
         assert!(result.fields.contains(&"pypiIndexMode".to_string()));
+        assert!(result.fields.contains(&"playwrightDownloadHost".to_string()));
         assert!(result.skipped.contains(&"proxy.httpProxy".to_string()));
 
         let _ = fs::remove_dir_all(dir);
@@ -319,6 +362,7 @@ mod tests {
                 "customCoreDir": "D:\\gsuid_core",
                 "pypiIndexMode": "manual",
                 "pypiIndexUrl": "https://mirrors.aliyun.com/pypi/simple/",
+                "playwrightDownloadHost": "https://cdn.npmmirror.com/binaries/playwright",
                 "preferredCorePort": 8899,
                 "hideToTrayOnClose": false,
                 "proxy": { "noProxy": "127.0.0.1,localhost,::1" }
@@ -335,10 +379,15 @@ mod tests {
         assert!(!settings.beginner_mode);
         assert_eq!(settings.custom_core_dir, "D:\\gsuid_core");
         assert_eq!(settings.pypi_index_mode, "manual");
+        assert_eq!(
+            settings.playwright_download_host,
+            "https://cdn.npmmirror.com/binaries/playwright"
+        );
         assert_eq!(settings.preferred_core_port, Some(8899));
         assert!(!settings.hide_to_tray_on_close);
         assert_eq!(settings.proxy.http_proxy, "http://user:secret@127.0.0.1:7890");
         assert!(result.fields.contains(&"pypiIndexMode".to_string()));
+        assert!(result.fields.contains(&"playwrightDownloadHost".to_string()));
         assert!(result.fields.contains(&"beginnerMode".to_string()));
         assert!(result.fields.contains(&"customCoreDir".to_string()));
         assert!(result.fields.contains(&"hideToTrayOnClose".to_string()));

@@ -77,11 +77,11 @@ export function buildGuideSteps({
       error: progress[0].error,
       content: (
         <>
-          <StepTitle index={1} title="环境预检与代理" />
+          <StepTitle index={1} title="环境预检与网络" />
           <p className="muted-block">
             {beginnerMode
               ? "先检查电脑环境是否能直接启动。GSDesk 完整安装包已包含 Git 和 Python，不需要用户手动打开命令行。"
-              : "代理会覆盖 Git、uv、Python 包下载和 Core 运行；默认保留 NO_PROXY=127.0.0.1,localhost,::1，避免本机 WebConsole 被代理。"}
+              : "先确认源码工具、uv、Python、端口和网络源是否可用；网络源和镜像在设置里单独管理。"}
           </p>
           <div className="guide-summary-grid">
             <SummaryItem
@@ -92,14 +92,6 @@ export function buildGuideSteps({
                   : displayText(toolchain?.gitError, "缺少内置 Git")
               }
             />
-            {!beginnerMode && (
-              <>
-                <SummaryItem label="HTTP_PROXY" value={displayText(settings?.proxy.httpProxy, "未设置")} />
-                <SummaryItem label="HTTPS_PROXY" value={displayText(settings?.proxy.httpsProxy, "未设置")} />
-                <SummaryItem label="ALL_PROXY" value={displayText(settings?.proxy.allProxy, "未设置")} />
-                <SummaryItem label="NO_PROXY" value={displayText(settings?.proxy.noProxy, "未设置")} />
-              </>
-            )}
           </div>
           <ResultList
             emptyText="预检无阻断或警告。"
@@ -118,7 +110,7 @@ export function buildGuideSteps({
         onClick: () => onStepChange(1),
       },
       secondary: {
-        label: beginnerMode ? "网络设置" : "配置代理",
+        label: "设置网络",
         icon: <Cable size={16} />,
         onClick: onOpenNetwork,
       },
@@ -262,7 +254,7 @@ export function buildGuideSteps({
         <>
           <StepTitle index={5} title="启动 gsuid_core" />
           <p className="muted-block">
-            默认优先使用 <code>8765</code> 端口，被占用时自动选择 <code>8766-8865</code>，界面会显示实际端口。
+            默认固定使用 <code>8765</code> 端口；如果被占用，先在检测处理里释放端口或到设置里改端口。
           </p>
           <div className="guide-summary-grid">
             <SummaryItem label="状态" value={statusText[core?.status ?? "uninitialized"]} />

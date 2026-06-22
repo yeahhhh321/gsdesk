@@ -41,7 +41,7 @@ assertFile("src-tauri/app-icon.svg");
 assert(tauriConfig.bundle.publisher === "yeahhhh321", "bundle.publisher must stay on yeahhhh321");
 assert(tauriConfig.bundle.homepage === "https://github.com/yeahhhh321/gsdesk", "bundle.homepage must point to the public repo");
 assert(tauriConfig.bundle.license === "GPL-3.0-or-later", "bundle.license must match LICENSE");
-assert(tauriConfig.identifier === "com.yeahhhh321.gsdesk", "Tauri identifier must stay stable for app data paths");
+assert(tauriConfig.identifier === "com.core.gsdesk", "Tauri identifier must stay stable for app data paths");
 assert(
   tauriConfig.bundle.windows?.nsis?.installerHooks === "windows/nsis-hooks.nsh",
   "bundle.windows.nsis.installerHooks must clean GSDesk app data on uninstall",
@@ -49,8 +49,8 @@ assert(
 assertFile("src-tauri/windows/nsis-hooks.nsh");
 const nsisHooks = fs.readFileSync("src-tauri/windows/nsis-hooks.nsh", "utf8");
 assert(nsisHooks.includes("NSIS_HOOK_POSTUNINSTALL"), "NSIS hooks must define NSIS_HOOK_POSTUNINSTALL");
-assert(nsisHooks.includes("$APPDATA\\com.yeahhhh321.gsdesk"), "NSIS uninstall hook must remove roaming app data");
-assert(nsisHooks.includes("$LOCALAPPDATA\\com.yeahhhh321.gsdesk"), "NSIS uninstall hook must remove local app data");
+assert(nsisHooks.includes("$APPDATA\\com.core.gsdesk"), "NSIS uninstall hook must remove roaming app data");
+assert(nsisHooks.includes("$LOCALAPPDATA\\com.core.gsdesk"), "NSIS uninstall hook must remove local app data");
 assert(
   tauriConfig.bundle.createUpdaterArtifacts === true,
   "bundle.createUpdaterArtifacts must stay enabled for shell auto update",

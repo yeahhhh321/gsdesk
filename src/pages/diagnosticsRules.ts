@@ -43,7 +43,7 @@ const FAILURE_RULES: FailureRule[] = [
   {
     allTerms: ["unicodeencodeerror", "gbk"],
     anyTerms: [],
-    explanation: "Python/控制台编码问题；GSDesk 已强制 UTF-8，仍出现时请保留诊断包继续排查启动环境。",
+    explanation: "Python/控制台编码问题；GSDesk 已强制 UTF-8，仍出现时请保留 Core 日志和操作记录继续排查启动环境。",
   },
   {
     allTerms: [],
@@ -93,7 +93,7 @@ export function buildLogFailureSummary(logs: LogEntry[]): LogFailureSummary | nu
   );
   return {
     title: explanation ? "识别到可能失败原因" : "识别到最近错误段",
-    explanation: displayText(explanation, "没有匹配到内置规则；优先查看错误段最底部一行，再导出诊断包保留完整上下文。"),
+    explanation: displayText(explanation, "没有匹配到内置规则；优先查看错误段最底部一行，并保留最近 Core 日志上下文。"),
     context,
   };
 }
@@ -169,7 +169,7 @@ export function buildTroubleshootingItems(appState: AppState, updateInfo?: Updat
       severity: "block",
       title: `最近任务失败：${failedTask.name}`,
       detail: `${failedTask.stage} · ${failedTask.message}`,
-      action: "打开 Core 日志或导出诊断包，保留任务历史和原始输出。",
+      action: "打开 Core 日志，保留操作记录和原始输出。",
     });
   }
 
@@ -189,7 +189,7 @@ export function buildTroubleshootingItems(appState: AppState, updateInfo?: Updat
       severity: "ok",
       title: "未发现阻断项",
       detail: "当前预检、Core 状态和最近任务没有暴露新的失败信号。",
-      action: "发布前仍需导出诊断包并执行真实 Core smoke。",
+      action: "发布前仍需执行真实 Core smoke 并保留日志。",
     });
   }
 
@@ -209,7 +209,7 @@ function preflightTroubleshootingItem(check: PreflightCheck): TroubleshootingIte
 function repairActionForCheck(check: PreflightCheck) {
   if (check.id === "uv") return "执行“安装/更新 uv”，然后重新运行初始化。";
   if (check.id === "git") return "重新安装包含内置 Git 的完整 GSDesk；高级用户也可以安装系统 Git 后重新检测。";
-  if (check.id === "port") return displayText(check.action, "强杀端口占用，或改回自动端口。");
+  if (check.id === "port") return displayText(check.action, "强杀端口占用，或改成其他可用端口。");
   if (check.id === "core_repo") return "运行首次安装引导；已有数据时优先使用运行时备份。";
   if (check.id === "venv") return "执行“重建 venv”或重跑依赖同步。";
   if (check.id === "pypi") return "重新测速 PyPI 镜像，保存最快可用源。";
@@ -234,7 +234,7 @@ function coreTroubleshootingItems(core: ServiceSnapshot): TroubleshootingItem[] 
       severity: "block",
       title: `Core 状态异常：${statusText[core.status]}`,
       detail: displayText(core.recentError, "Core 已失败或异常退出，但当前快照没有记录具体错误。"),
-      action: "打开 Core 日志，查看最近 traceback；随后导出诊断包。",
+      action: "打开 Core 日志，查看最近 traceback。",
     });
   } else if (core.recentError) {
     items.push({
@@ -242,7 +242,7 @@ function coreTroubleshootingItems(core: ServiceSnapshot): TroubleshootingItem[] 
       severity: "warn",
       title: "Core 最近错误",
       detail: core.recentError,
-      action: "如果错误重复出现，先重启 Core；仍失败再导出诊断包。",
+      action: "如果错误重复出现，先重启 Core；仍失败再保留最近日志和操作记录。",
     });
   }
   if (core.status === "running" && !core.webconsoleAvailable) {
