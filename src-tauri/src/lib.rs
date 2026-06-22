@@ -19,390 +19,586 @@ mod update;
 use std::path::PathBuf;
 use std::process::Command;
 
+use chrono::Utc;
 use models::{
-    AppStateResponse, ClearAppDataResult, ClearPortRequest, ClearPortResult, CoreUpdateRequest,
-    CoreUpdateResult, LogEntry, MirrorCheckResult, NetworkDiagnosticResult, ProcessResourceUsage,
-    RepairRuntimeRequest, RuntimeBackupResult, RuntimeRestoreRequest, RuntimeRestoreResult,
-    ServiceSnapshot, Settings, SettingsTransferRequest, SettingsTransferResult, SourceProbeResult,
-    StartServiceRequest, UpdateInfo, UpdateInstallResult, WebConsoleInfo,
+    ActionResultEvent, AppStateChangedEvent, AppStateResponse, ClearAppDataResult,
+    ClearPortRequest, ClearPortResult, CoreUpdateRequest, CoreUpdateResult, LogEntry,
+    MirrorCheckResult, NetworkDiagnosticResult, ProcessResourceUsage, RepairRuntimeRequest,
+    RuntimeBackupResult, RuntimeRestoreRequest, RuntimeRestoreResult, ServiceSnapshot, Settings,
+    SettingsTransferRequest, SettingsTransferResult, SourceProbeResult, StartServiceRequest,
+    UpdateInfo, UpdateInstallResult, WebConsoleInfo,
 };
+use serde::Serialize;
 use service::SharedRuntime;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
-#[tauri::command]
-fn get_app_state(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-) -> Result<AppStateResponse, String> {
-    app_state(&app, &runtime)
+async fn run_blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("后台任务执行失败: {error}"))?
 }
 
-#[tauri::command]
-fn save_settings(app: AppHandle, settings: Settings) -> Result<AppStateResponse, String> {
-    let (_, paths) = paths::app_paths(&app)?;
-    settings::save_settings_file(&PathBuf::from(paths.settings_file), &settings)?;
-    let runtime = app.state::<SharedRuntime>();
-    app_state(&app, &runtime)
-}
-
-#[tauri::command]
-fn configure_proxy(app: AppHandle, settings: Settings) -> Result<AppStateResponse, String> {
-    save_settings(app, settings)
-}
-
-#[tauri::command]
-fn probe_sources(app: AppHandle) -> Result<Vec<SourceProbeResult>, String> {
-    let settings = load_settings_for_app(&app)?;
-    let (_, paths) = paths::app_paths(&app)?;
-    Ok(network::probe_sources(&settings, toolchain::git_program(&app, &paths)))
-}
-
-#[tauri::command]
-fn check_pypi_mirrors(app: AppHandle) -> Result<Vec<MirrorCheckResult>, String> {
-    let settings = load_settings_for_app(&app)?;
-    network::check_mirrors(&settings)
-}
-
-#[tauri::command]
-fn test_network_targets(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-) -> Result<Vec<NetworkDiagnosticResult>, String> {
-    let settings = load_settings_for_app(&app)?;
-    let (_, paths) = paths::app_paths(&app)?;
-    service::attach_persisted_core_if_running(&app, &runtime, &paths);
-    let webconsole_url = {
-        let mut guard = runtime.lock();
-        service::snapshot(&mut guard, &paths, service::core_git_metadata(&app, &paths))
-            .into_iter()
-            .find(|item| item.service_id == service::GSUID_SERVICE_ID)
-            .and_then(|item| item.url)
-            .map(|url| format!("{}/app", url.trim_end_matches('/')))
-    };
-    Ok(network::diagnose_targets(&settings, webconsole_url, toolchain::git_program(&app, &paths)))
-}
-
-#[tauri::command]
-fn init_core_runtime(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-) -> Result<AppStateResponse, String> {
-    let settings = load_settings_for_app(&app)?;
-    service::init_core_runtime(&app, &runtime, &settings)?;
-    app_state(&app, &runtime)
-}
-
-#[tauri::command]
-fn start_service(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-    request: Option<StartServiceRequest>,
-) -> Result<ServiceSnapshot, String> {
-    let settings = load_settings_for_app(&app)?;
-    service::start_core(&app, &runtime, &settings, request)
-}
-
-#[tauri::command]
-fn stop_service(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-    service_id: Option<String>,
-) -> Result<AppStateResponse, String> {
-    service::ensure_gsuid_service(service_id.as_deref())?;
-    service::stop_core(&app, &runtime)?;
-    app_state(&app, &runtime)
-}
-
-#[tauri::command]
-fn restart_service(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-    service_id: Option<String>,
-) -> Result<ServiceSnapshot, String> {
-    service::ensure_gsuid_service(service_id.as_deref())?;
-    service::stop_core(&app, &runtime)?;
-    let settings = load_settings_for_app(&app)?;
-    service::start_core(&app, &runtime, &settings, None)
-}
-
-#[tauri::command]
-fn cancel_current_task(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-) -> Result<AppStateResponse, String> {
-    service::cancel_current_task(&app, &runtime)?;
-    app_state(&app, &runtime)
-}
-
-#[tauri::command]
-fn repair_runtime(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-    request: RepairRuntimeRequest,
-) -> Result<AppStateResponse, String> {
-    let settings = load_settings_for_app(&app)?;
-    service::repair_runtime(&app, &runtime, &settings, request)?;
-    app_state(&app, &runtime)
-}
-
-#[tauri::command]
-fn clear_occupied_port(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-    request: Option<ClearPortRequest>,
-) -> Result<ClearPortResult, String> {
-    let settings = load_settings_for_app(&app)?;
-    let port =
-        request.and_then(|request| request.port).or(settings.preferred_core_port).unwrap_or(8765);
-    let task_id = service::start_runtime_task(
-        &runtime,
-        "清理端口占用",
-        "detect",
-        &format!("检查并强杀占用端口 {port} 的进程"),
-    );
-    let result = ports::clear_occupied_port(port);
-    match &result {
-        Ok(result) => {
-            service::finish_runtime_task(&runtime, task_id, "success", "done", &result.message);
-            service::push_system_log(&app, &runtime, "info", &result.message);
-        }
-        Err(error) => {
-            service::finish_runtime_task(&runtime, task_id, "failed", "error", error);
-            service::push_system_log(&app, &runtime, "error", error);
-        }
-    }
+async fn run_action<T, F>(app: AppHandle, action: &'static str, work: F) -> Result<T, String>
+where
+    T: Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let result = run_blocking(work).await;
+    emit_action_result(&app, action, &result);
+    emit_state_changed(&app, action);
     result
 }
 
-#[tauri::command]
-fn clear_app_data(
-    app: AppHandle,
-    runtime: State<SharedRuntime>,
-) -> Result<ClearAppDataResult, String> {
-    let (_, paths) = paths::app_paths(&app)?;
-    service::stop_core(&app, &runtime)?;
-    let result = data_cleanup::clear_app_data(&paths)?;
-    service::reset_runtime_after_data_clear(&runtime);
-    Ok(result)
+fn emit_action_result<T: Serialize>(app: &AppHandle, action: &str, result: &Result<T, String>) {
+    let (ok, payload, error) = match result {
+        Ok(value) => (true, serde_json::to_value(value).ok(), None),
+        Err(message) => (false, None, Some(message.clone())),
+    };
+    let event = ActionResultEvent {
+        action: action.to_string(),
+        ok,
+        result: payload,
+        error,
+        emitted_at: Utc::now().to_rfc3339(),
+    };
+    let _ = app.emit("gsdesk-action-result", event);
+}
+
+fn emit_state_changed(app: &AppHandle, reason: &str) {
+    let event =
+        AppStateChangedEvent { reason: reason.to_string(), emitted_at: Utc::now().to_rfc3339() };
+    let _ = app.emit("gsdesk-state-changed", event);
 }
 
 #[tauri::command]
-fn core_update(
+async fn get_app_state(
     app: AppHandle,
-    runtime: State<SharedRuntime>,
+    runtime: State<'_, SharedRuntime>,
+) -> Result<AppStateResponse, String> {
+    let runtime = runtime.inner().clone();
+    run_blocking(move || app_state(&app, &runtime)).await
+}
+
+#[tauri::command]
+async fn save_settings(app: AppHandle, settings: Settings) -> Result<AppStateResponse, String> {
+    let action_app = app.clone();
+    run_action(app, "save_settings", move || {
+        let (_, paths) = paths::app_paths(&action_app)?;
+        settings::save_settings_file(&PathBuf::from(paths.settings_file), &settings)?;
+        let runtime = action_app.state::<SharedRuntime>().inner().clone();
+        app_state(&action_app, &runtime)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn configure_proxy(app: AppHandle, settings: Settings) -> Result<AppStateResponse, String> {
+    let action_app = app.clone();
+    run_action(app, "configure_proxy", move || {
+        let (_, paths) = paths::app_paths(&action_app)?;
+        settings::save_settings_file(&PathBuf::from(paths.settings_file), &settings)?;
+        let runtime = action_app.state::<SharedRuntime>().inner().clone();
+        app_state(&action_app, &runtime)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn probe_sources(app: AppHandle) -> Result<Vec<SourceProbeResult>, String> {
+    let action_app = app.clone();
+    run_action(app, "probe_sources", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        let (_, paths) = paths::app_paths(&action_app)?;
+        Ok(network::probe_sources(&settings, toolchain::git_program(&action_app, &paths)))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn check_pypi_mirrors(app: AppHandle) -> Result<Vec<MirrorCheckResult>, String> {
+    let action_app = app.clone();
+    run_action(app, "check_pypi_mirrors", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        network::check_mirrors(&settings)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn test_network_targets(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+) -> Result<Vec<NetworkDiagnosticResult>, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "test_network_targets", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        let (_, paths) = paths::app_paths(&action_app)?;
+        service::attach_persisted_core_if_running(&action_app, &runtime, &paths);
+        let webconsole_url = {
+            let mut guard = runtime.lock();
+            service::snapshot(&mut guard, &paths, service::core_git_metadata(&action_app, &paths))
+                .into_iter()
+                .find(|item| item.service_id == service::GSUID_SERVICE_ID)
+                .and_then(|item| item.url)
+                .map(|url| format!("{}/app", url.trim_end_matches('/')))
+        };
+        Ok(network::diagnose_targets(
+            &settings,
+            webconsole_url,
+            toolchain::git_program(&action_app, &paths),
+        ))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn init_core_runtime(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+) -> Result<AppStateResponse, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "init_core_runtime", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        service::init_core_runtime(&action_app, &runtime, &settings)?;
+        app_state(&action_app, &runtime)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn start_service(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+    request: Option<StartServiceRequest>,
+) -> Result<ServiceSnapshot, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "start_service", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        service::start_core(&action_app, &runtime, &settings, request)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn stop_service(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+    service_id: Option<String>,
+) -> Result<AppStateResponse, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "stop_service", move || {
+        service::ensure_gsuid_service(service_id.as_deref())?;
+        service::stop_core(&action_app, &runtime)?;
+        app_state(&action_app, &runtime)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn restart_service(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+    service_id: Option<String>,
+) -> Result<ServiceSnapshot, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "restart_service", move || {
+        service::ensure_gsuid_service(service_id.as_deref())?;
+        service::stop_core(&action_app, &runtime)?;
+        let settings = load_settings_for_app(&action_app)?;
+        service::start_core(&action_app, &runtime, &settings, None)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn cancel_current_task(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+) -> Result<AppStateResponse, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "cancel_current_task", move || {
+        service::cancel_current_task(&action_app, &runtime)?;
+        app_state(&action_app, &runtime)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn repair_runtime(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+    request: RepairRuntimeRequest,
+) -> Result<AppStateResponse, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "repair_runtime", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        service::repair_runtime(&action_app, &runtime, &settings, request)?;
+        app_state(&action_app, &runtime)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn clear_occupied_port(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+    request: Option<ClearPortRequest>,
+) -> Result<ClearPortResult, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "clear_occupied_port", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        let port = request
+            .and_then(|request| request.port)
+            .or(settings.preferred_core_port)
+            .unwrap_or(8765);
+        let task_id = service::start_runtime_task(
+            &runtime,
+            "清理端口占用",
+            "detect",
+            &format!("检查并强杀占用端口 {port} 的进程"),
+        );
+        let result = ports::clear_occupied_port(port);
+        match &result {
+            Ok(result) => {
+                service::finish_runtime_task(&runtime, task_id, "success", "done", &result.message);
+                service::push_system_log(&action_app, &runtime, "info", &result.message);
+            }
+            Err(error) => {
+                service::finish_runtime_task(&runtime, task_id, "failed", "error", error);
+                service::push_system_log(&action_app, &runtime, "error", error);
+            }
+        }
+        result
+    })
+    .await
+}
+
+#[tauri::command]
+async fn clear_app_data(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+) -> Result<ClearAppDataResult, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "clear_app_data", move || {
+        let (_, paths) = paths::app_paths(&action_app)?;
+        service::stop_core(&action_app, &runtime)?;
+        let result = data_cleanup::clear_app_data(&paths)?;
+        service::reset_runtime_after_data_clear(&runtime);
+        Ok(result)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn core_update(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
     request: CoreUpdateRequest,
 ) -> Result<CoreUpdateResult, String> {
-    let settings = load_settings_for_app(&app)?;
-    service::core_update(&app, &runtime, &settings, request)
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "core_update", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        service::core_update(&action_app, &runtime, &settings, request)
+    })
+    .await
 }
 
 #[tauri::command]
-fn create_runtime_backup(
+async fn create_runtime_backup(
     app: AppHandle,
-    runtime: State<SharedRuntime>,
+    runtime: State<'_, SharedRuntime>,
 ) -> Result<RuntimeBackupResult, String> {
-    service::create_runtime_backup(&app, &runtime)
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "create_runtime_backup", move || {
+        service::create_runtime_backup(&action_app, &runtime)
+    })
+    .await
 }
 
 #[tauri::command]
-fn restore_runtime_backup(
+async fn restore_runtime_backup(
     app: AppHandle,
-    runtime: State<SharedRuntime>,
+    runtime: State<'_, SharedRuntime>,
     request: Option<RuntimeRestoreRequest>,
 ) -> Result<RuntimeRestoreResult, String> {
-    service::restore_runtime_backup(
-        &app,
-        &runtime,
-        request.unwrap_or(RuntimeRestoreRequest { path: None }),
-    )
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "restore_runtime_backup", move || {
+        service::restore_runtime_backup(
+            &action_app,
+            &runtime,
+            request.unwrap_or(RuntimeRestoreRequest { path: None }),
+        )
+    })
+    .await
 }
 
 #[tauri::command]
-fn export_settings(app: AppHandle) -> Result<SettingsTransferResult, String> {
-    let (_, paths) = paths::app_paths(&app)?;
-    let settings = settings::load_settings(&PathBuf::from(&paths.settings_file));
-    settings::export_portable_settings(&PathBuf::from(paths.backups_dir), &settings)
+async fn export_settings(app: AppHandle) -> Result<SettingsTransferResult, String> {
+    let action_app = app.clone();
+    run_action(app, "export_settings", move || {
+        let (_, paths) = paths::app_paths(&action_app)?;
+        let settings = settings::load_settings(&PathBuf::from(&paths.settings_file));
+        settings::export_portable_settings(&PathBuf::from(paths.backups_dir), &settings)
+    })
+    .await
 }
 
 #[tauri::command]
-fn import_settings(
+async fn import_settings(
     app: AppHandle,
     request: Option<SettingsTransferRequest>,
 ) -> Result<AppStateResponse, String> {
-    let (_, paths) = paths::app_paths(&app)?;
-    let current = settings::load_settings(&PathBuf::from(&paths.settings_file));
-    let request_path =
-        request.as_ref().and_then(|request| request.path.as_ref()).map(PathBuf::from);
-    let (settings, _) = settings::import_portable_settings(
-        &PathBuf::from(&paths.backups_dir),
-        &current,
-        request_path.as_deref(),
-    )?;
-    settings::save_settings_file(&PathBuf::from(paths.settings_file), &settings)?;
-    let runtime = app.state::<SharedRuntime>();
-    app_state(&app, &runtime)
+    let action_app = app.clone();
+    run_action(app, "import_settings", move || {
+        let (_, paths) = paths::app_paths(&action_app)?;
+        let current = settings::load_settings(&PathBuf::from(&paths.settings_file));
+        let request_path =
+            request.as_ref().and_then(|request| request.path.as_ref()).map(PathBuf::from);
+        let (settings, _) = settings::import_portable_settings(
+            &PathBuf::from(&paths.backups_dir),
+            &current,
+            request_path.as_deref(),
+        )?;
+        settings::save_settings_file(&PathBuf::from(paths.settings_file), &settings)?;
+        let runtime = action_app.state::<SharedRuntime>().inner().clone();
+        app_state(&action_app, &runtime)
+    })
+    .await
 }
 
 #[tauri::command]
-fn bootstrap_uv(app: AppHandle, runtime: State<SharedRuntime>) -> Result<AppStateResponse, String> {
-    let settings = load_settings_for_app(&app)?;
-    let (_, paths) = paths::app_paths(&app)?;
-    let task_id = service::start_runtime_task(
-        &runtime,
-        "安装 uv",
-        "prepare",
-        "准备使用内置 Python 创建或更新 uv",
-    );
-    service::push_system_log(&app, &runtime, "info", "开始使用内置 Python 创建或更新 uv");
-    let result = toolchain::bootstrap_uv(&app, &paths, &settings, |stage, message| {
-        service::update_runtime_task(&runtime, task_id, stage, message);
-        service::push_system_log(&app, &runtime, "info", message);
-    });
-    match result {
-        Ok(info) => {
-            if service::take_cancel_requested(&runtime) {
-                let message = "任务已取消: 安装 uv".to_string();
-                service::finish_runtime_task(&runtime, task_id, "cancelled", "cancelled", &message);
-                service::push_system_log(&app, &runtime, "warn", &message);
-                return Err(message);
-            }
-            service::finish_runtime_task(
-                &runtime,
-                task_id,
-                "success",
-                "done",
-                "uv 已通过内置 Python 更新并验证可用",
-            );
-            service::push_system_log(
-                &app,
-                &runtime,
-                "info",
-                &format!(
-                    "uv 已可用: {}",
-                    info.uv_version.unwrap_or_else(|| "版本未知".to_string())
-                ),
-            );
-            app_state(&app, &runtime)
-        }
-        Err(error) => {
-            let status =
-                if service::is_task_cancelled_error(&error) { "cancelled" } else { "failed" };
-            let stage = if status == "cancelled" { "cancelled" } else { "error" };
-            let level = if status == "cancelled" { "warn" } else { "error" };
-            service::finish_runtime_task(&runtime, task_id, status, stage, &error);
-            service::push_system_log(&app, &runtime, level, &error);
-            Err(error)
-        }
-    }
-}
-
-#[tauri::command]
-fn check_service_health(
+async fn bootstrap_uv(
     app: AppHandle,
-    runtime: State<SharedRuntime>,
+    runtime: State<'_, SharedRuntime>,
 ) -> Result<AppStateResponse, String> {
-    app_state_with_options(
-        &app,
-        &runtime,
-        AppStateOptions { sync_logs: false, include_logs: false },
-    )
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "bootstrap_uv", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        let (_, paths) = paths::app_paths(&action_app)?;
+        let task_id = service::start_runtime_task(
+            &runtime,
+            "安装 uv",
+            "prepare",
+            "准备使用内置 Python 创建或更新 uv",
+        );
+        service::push_system_log(
+            &action_app,
+            &runtime,
+            "info",
+            "开始使用内置 Python 创建或更新 uv",
+        );
+        let result = toolchain::bootstrap_uv(&action_app, &paths, &settings, |stage, message| {
+            service::update_runtime_task(&runtime, task_id, stage, message);
+            service::push_system_log(&action_app, &runtime, "info", message);
+        });
+        match result {
+            Ok(info) => {
+                if service::take_cancel_requested(&runtime) {
+                    let message = "任务已取消: 安装 uv".to_string();
+                    service::finish_runtime_task(
+                        &runtime,
+                        task_id,
+                        "cancelled",
+                        "cancelled",
+                        &message,
+                    );
+                    service::push_system_log(&action_app, &runtime, "warn", &message);
+                    return Err(message);
+                }
+                service::finish_runtime_task(
+                    &runtime,
+                    task_id,
+                    "success",
+                    "done",
+                    "uv 已通过内置 Python 更新并验证可用",
+                );
+                service::push_system_log(
+                    &action_app,
+                    &runtime,
+                    "info",
+                    &format!(
+                        "uv 已可用: {}",
+                        info.uv_version.unwrap_or_else(|| "版本未知".to_string())
+                    ),
+                );
+                app_state(&action_app, &runtime)
+            }
+            Err(error) => {
+                let status =
+                    if service::is_task_cancelled_error(&error) { "cancelled" } else { "failed" };
+                let stage = if status == "cancelled" { "cancelled" } else { "error" };
+                let level = if status == "cancelled" { "warn" } else { "error" };
+                service::finish_runtime_task(&runtime, task_id, status, stage, &error);
+                service::push_system_log(&action_app, &runtime, level, &error);
+                Err(error)
+            }
+        }
+    })
+    .await
 }
 
 #[tauri::command]
-fn open_webconsole(
+async fn check_service_health(
     app: AppHandle,
-    runtime: State<SharedRuntime>,
+    runtime: State<'_, SharedRuntime>,
+) -> Result<AppStateResponse, String> {
+    let runtime = runtime.inner().clone();
+    run_blocking(move || {
+        app_state_with_options(
+            &app,
+            &runtime,
+            AppStateOptions { sync_logs: false, include_logs: false },
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+async fn open_webconsole(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
     service_id: Option<String>,
 ) -> Result<WebConsoleInfo, String> {
-    service::ensure_gsuid_service(service_id.as_deref())?;
-    let (_, paths) = paths::app_paths(&app)?;
-    service::attach_persisted_core_if_running(&app, &runtime, &paths);
-    let mut guard = runtime.lock();
-    let snapshot = service::snapshot(&mut guard, &paths, service::core_git_metadata(&app, &paths))
-        .into_iter()
-        .find(|item| item.service_id == service::GSUID_SERVICE_ID)
-        .ok_or_else(|| "无法读取 Core 状态".to_string())?;
-    let url = snapshot
-        .url
-        .map(|url| format!("{}/app", url.trim_end_matches('/')))
-        .ok_or_else(|| "Core 尚未启动，无法打开 WebConsole".to_string())?;
-    Ok(WebConsoleInfo { url })
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "open_webconsole", move || {
+        service::ensure_gsuid_service(service_id.as_deref())?;
+        let (_, paths) = paths::app_paths(&action_app)?;
+        service::attach_persisted_core_if_running(&action_app, &runtime, &paths);
+        let mut guard = runtime.lock();
+        let snapshot =
+            service::snapshot(&mut guard, &paths, service::core_git_metadata(&action_app, &paths))
+                .into_iter()
+                .find(|item| item.service_id == service::GSUID_SERVICE_ID)
+                .ok_or_else(|| "无法读取 Core 状态".to_string())?;
+        let url = snapshot
+            .url
+            .map(|url| format!("{}/app", url.trim_end_matches('/')))
+            .ok_or_else(|| "Core 尚未启动，无法打开 WebConsole".to_string())?;
+        Ok(WebConsoleInfo { url })
+    })
+    .await
 }
 
 #[tauri::command]
-fn open_external_url(url: String) -> Result<(), String> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return Err("外部打开失败: URL 为空".to_string());
-    }
-    if !is_local_webconsole_url(trimmed) {
-        return Err(format!("外部打开失败: 只允许打开本机 WebConsole 地址: {trimmed}"));
-    }
-    tauri_plugin_opener::open_url(trimmed, None::<&str>)
-        .map_err(|error| format!("外部打开失败: {error}"))
+async fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
+    run_action(app, "open_external_url", move || {
+        let trimmed = url.trim();
+        if trimmed.is_empty() {
+            return Err("外部打开失败: URL 为空".to_string());
+        }
+        if !is_local_webconsole_url(trimmed) {
+            return Err(format!("外部打开失败: 只允许打开本机 WebConsole 地址: {trimmed}"));
+        }
+        tauri_plugin_opener::open_url(trimmed, None::<&str>)
+            .map_err(|error| format!("外部打开失败: {error}"))
+    })
+    .await
 }
 
 #[tauri::command]
-fn stream_logs(app: AppHandle, runtime: State<SharedRuntime>) -> Result<Vec<LogEntry>, String> {
-    service::sync_core_file_logs(&app, &runtime)?;
-    let guard = runtime.lock();
-    Ok(service::recent_core_logs(&guard))
+async fn stream_logs(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+) -> Result<Vec<LogEntry>, String> {
+    let runtime = runtime.inner().clone();
+    run_blocking(move || {
+        service::sync_core_file_logs(&app, &runtime)?;
+        let guard = runtime.lock();
+        Ok(service::recent_core_logs(&guard))
+    })
+    .await
 }
 
 #[tauri::command]
-fn export_diagnostics(app: AppHandle, runtime: State<SharedRuntime>) -> Result<String, String> {
-    let settings = load_settings_for_app(&app)?;
-    let state = app_state(&app, &runtime)?;
-    diagnostics::export(&app, &state, &settings)
+async fn export_diagnostics(
+    app: AppHandle,
+    runtime: State<'_, SharedRuntime>,
+) -> Result<String, String> {
+    let runtime = runtime.inner().clone();
+    let action_app = app.clone();
+    run_action(app, "export_diagnostics", move || {
+        let settings = load_settings_for_app(&action_app)?;
+        let state = app_state(&action_app, &runtime)?;
+        diagnostics::export(&action_app, &state, &settings)
+    })
+    .await
 }
 
 #[tauri::command]
 async fn check_shell_update(app: AppHandle) -> Result<UpdateInfo, String> {
-    Ok(update::check_shell_update(&app).await)
+    let result = Ok(update::check_shell_update(&app).await);
+    emit_action_result(&app, "check_shell_update", &result);
+    emit_state_changed(&app, "check_shell_update");
+    result
 }
 
 #[tauri::command]
 async fn install_shell_update(app: AppHandle) -> Result<UpdateInstallResult, String> {
-    update::install_shell_update(app).await
+    let result = update::install_shell_update(app.clone()).await;
+    emit_action_result(&app, "install_shell_update", &result);
+    emit_state_changed(&app, "install_shell_update");
+    result
 }
 
 #[tauri::command]
-fn open_path(app: AppHandle, key: String) -> Result<(), String> {
-    let (_, paths) = paths::app_paths(&app)?;
-    let target = match key.as_str() {
-        "appData" => PathBuf::from(paths.app_data),
-        "runtime" => PathBuf::from(paths.runtime),
-        "toolsDir" => PathBuf::from(paths.tools_dir),
-        "coreDir" => PathBuf::from(paths.core_dir),
-        "venvDir" => PathBuf::from(paths.venv_dir),
-        "uvCacheDir" => PathBuf::from(paths.uv_cache_dir),
-        "uvPythonDir" => PathBuf::from(paths.uv_python_dir),
-        "uvExecutable" => PathBuf::from(paths.uv_executable)
-            .parent()
-            .map(PathBuf::from)
-            .ok_or_else(|| "uvExecutable 缺少父目录".to_string())?,
-        "logsDir" => PathBuf::from(paths.logs_dir),
-        "diagnosticsDir" => PathBuf::from(paths.diagnostics_dir),
-        "backupsDir" => PathBuf::from(paths.backups_dir),
-        "settingsFile" => PathBuf::from(paths.settings_file)
-            .parent()
-            .map(PathBuf::from)
-            .ok_or_else(|| "settingsFile 缺少父目录".to_string())?,
-        _ => return Err(format!("不允许打开未知路径键: {key}")),
-    };
-    std::fs::create_dir_all(&target).ok();
-    if cfg!(windows) {
-        Command::new("explorer")
-            .arg(&target)
-            .spawn()
-            .map_err(|error| format!("打开目录失败: {error}"))?;
-    } else {
-        Command::new("open")
-            .arg(&target)
-            .spawn()
-            .map_err(|error| format!("打开目录失败: {error}"))?;
-    }
-    Ok(())
+async fn open_path(app: AppHandle, key: String) -> Result<(), String> {
+    let action_app = app.clone();
+    run_action(app, "open_path", move || {
+        let (_, paths) = paths::app_paths(&action_app)?;
+        let target = match key.as_str() {
+            "appData" => PathBuf::from(paths.app_data),
+            "runtime" => PathBuf::from(paths.runtime),
+            "toolsDir" => PathBuf::from(paths.tools_dir),
+            "coreDir" => PathBuf::from(paths.core_dir),
+            "venvDir" => PathBuf::from(paths.venv_dir),
+            "uvCacheDir" => PathBuf::from(paths.uv_cache_dir),
+            "uvPythonDir" => PathBuf::from(paths.uv_python_dir),
+            "uvExecutable" => PathBuf::from(paths.uv_executable)
+                .parent()
+                .map(PathBuf::from)
+                .ok_or_else(|| "uvExecutable 缺少父目录".to_string())?,
+            "logsDir" => PathBuf::from(paths.logs_dir),
+            "diagnosticsDir" => PathBuf::from(paths.diagnostics_dir),
+            "backupsDir" => PathBuf::from(paths.backups_dir),
+            "settingsFile" => PathBuf::from(paths.settings_file)
+                .parent()
+                .map(PathBuf::from)
+                .ok_or_else(|| "settingsFile 缺少父目录".to_string())?,
+            _ => return Err(format!("不允许打开未知路径键: {key}")),
+        };
+        std::fs::create_dir_all(&target).ok();
+        if cfg!(windows) {
+            Command::new("explorer")
+                .arg(&target)
+                .spawn()
+                .map_err(|error| format!("打开目录失败: {error}"))?;
+        } else {
+            Command::new("open")
+                .arg(&target)
+                .spawn()
+                .map_err(|error| format!("打开目录失败: {error}"))?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 fn load_settings_for_app(app: &AppHandle) -> Result<Settings, String> {

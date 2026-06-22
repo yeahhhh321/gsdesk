@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { App as AntdApp } from "antd";
-import { gsdeskApi, subscribeLogBatches, subscribeLogs } from "./api";
+import { gsdeskApi, subscribeActionResults, subscribeLogBatches, subscribeLogs, subscribeStateChanges } from "./api";
 import { isCoreJsonLog } from "./logModel";
 import { findGsuidCore } from "./serviceIds";
 import { getSetupProgress } from "./ui/setupProgress";
+import type { ActionResultEvent } from "./api";
 import type {
   AppState,
   ClearAppDataResult,
@@ -26,13 +27,20 @@ import type { AppSectionKey } from "./ui/appSections";
 const MAX_LOG_BUFFER = 5000;
 const MAX_PENDING_LOG_BUFFER = 2000;
 const LOG_FLUSH_DELAY_MS = 80;
-const HEALTH_POLL_INTERVAL_MS = 1500;
+const STATE_REFRESH_DELAY_MS = 120;
 const WEBCONSOLE_READY_TIMEOUT_MS = 75_000;
 const INSTALL_GUIDE_SEEN_KEY = "gsdesk.installGuide.seen";
 
 type RepairAction = "sync_deps" | "rebuild_venv" | "reclone_core" | "clear_uv_cache";
 type CoreUpdateAction = "check" | "clean" | "list_commits" | "update" | "rollback";
 type CoreUpdateChannel = "stable" | "latest" | "dev";
+type WebconsoleWaitOutcome = "ready" | "failed" | "waiting" | "timeout";
+
+interface WebconsoleStateWaiter {
+  evaluate: (state: AppState) => WebconsoleWaitOutcome | undefined;
+  resolve: (outcome: WebconsoleWaitOutcome) => void;
+  timeoutId: number;
+}
 
 export function useAppController() {
   const { message } = AntdApp.useApp();
@@ -56,7 +64,10 @@ export function useAppController() {
   const pendingLogsRef = useRef<LogEntry[]>([]);
   const activeKeyRef = useRef<AppSectionKey>("overview");
   const appStateRef = useRef<AppState | undefined>(undefined);
-  const healthPollInFlightRef = useRef(false);
+  const stateRefreshTimerRef = useRef<number | undefined>(undefined);
+  const stateRefreshInFlightRef = useRef(false);
+  const stateRefreshQueuedRef = useRef(false);
+  const webconsoleWaitersRef = useRef<WebconsoleStateWaiter[]>([]);
   const installGuideAutoOpened = useRef(false);
   const shellUpdateAutoChecked = useRef(false);
 
@@ -82,6 +93,7 @@ export function useAppController() {
     appStateRef.current = compactState;
     setAppStateValue(compactState);
     setWebconsoleUrl(coreWebconsoleUrl(findGsuidCore(compactState.services)));
+    resolveWebconsoleWaiters(compactState);
   }
 
   function requestLogPaint() {
@@ -117,6 +129,13 @@ export function useAppController() {
     scheduleLogFlush();
   }
 
+  function handleLogNotification(logs: LogEntry[]) {
+    enqueueLogs(logs);
+    if (logs.some(shouldRefreshStateForLog)) {
+      scheduleStateRefresh();
+    }
+  }
+
   function scheduleLogFlush() {
     if (logFlushTimerRef.current !== undefined) return;
     logFlushTimerRef.current = window.setTimeout(() => {
@@ -139,13 +158,30 @@ export function useAppController() {
     setAppState(state);
   }
 
-  async function pollHealthState() {
-    if (healthPollInFlightRef.current) return;
-    healthPollInFlightRef.current = true;
+  function scheduleStateRefresh() {
+    if (stateRefreshTimerRef.current !== undefined) return;
+    stateRefreshTimerRef.current = window.setTimeout(() => {
+      stateRefreshTimerRef.current = undefined;
+      void refreshStateFromNotification();
+    }, STATE_REFRESH_DELAY_MS);
+  }
+
+  async function refreshStateFromNotification() {
+    if (stateRefreshInFlightRef.current) {
+      stateRefreshQueuedRef.current = true;
+      return;
+    }
+    stateRefreshInFlightRef.current = true;
     try {
       await refreshHealthState();
+    } catch {
+      // 通知触发的状态刷新不打断当前操作，显式按钮动作会单独反馈错误。
     } finally {
-      healthPollInFlightRef.current = false;
+      stateRefreshInFlightRef.current = false;
+      if (stateRefreshQueuedRef.current) {
+        stateRefreshQueuedRef.current = false;
+        scheduleStateRefresh();
+      }
     }
   }
 
@@ -153,6 +189,47 @@ export function useAppController() {
     const state = await gsdeskApi.checkServiceHealth();
     setAppState(state);
     return state;
+  }
+
+  function handleActionResult(event: ActionResultEvent) {
+    if (event.ok) {
+      applyActionResult(event);
+    }
+    scheduleStateRefresh();
+  }
+
+  function applyActionResult(event: ActionResultEvent) {
+    const result = event.result;
+    if (event.action === "probe_sources" && isSourceProbeResults(result)) {
+      setSourceResults(result);
+      return;
+    }
+    if (event.action === "check_pypi_mirrors" && isMirrorCheckResults(result)) {
+      setMirrorResults(result);
+      return;
+    }
+    if (event.action === "test_network_targets" && isNetworkDiagnosticResults(result)) {
+      setNetworkDiagnostics(result);
+      return;
+    }
+    if (event.action === "check_shell_update" && isUpdateInfo(result)) {
+      setUpdateInfo(result);
+    }
+  }
+
+  function resolveWebconsoleWaiters(state: AppState) {
+    if (!webconsoleWaitersRef.current.length) return;
+    const remaining: WebconsoleStateWaiter[] = [];
+    for (const waiter of webconsoleWaitersRef.current) {
+      const outcome = waiter.evaluate(state);
+      if (outcome) {
+        window.clearTimeout(waiter.timeoutId);
+        waiter.resolve(outcome);
+      } else {
+        remaining.push(waiter);
+      }
+    }
+    webconsoleWaitersRef.current = remaining;
   }
 
   async function runAction<T>(
@@ -244,21 +321,36 @@ export function useAppController() {
   }
 
   async function waitForWebconsoleReady(timeoutMs = WEBCONSOLE_READY_TIMEOUT_MS) {
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      const state = await refreshHealthState();
-      const nextCore = findGsuidCore(state.services);
-      if (nextCore?.status === "failed") {
-        message.error(nextCore.recentError ?? "Core 启动失败");
-        return false;
-      }
-      if (nextCore?.status === "running" && nextCore.webconsoleAvailable) {
-        return true;
-      }
-      await delay(1000);
+    const outcome = await waitForWebconsoleOutcome(timeoutMs);
+    if (outcome === "ready") {
+      return true;
+    }
+    if (outcome === "failed") {
+      const currentCore = appStateRef.current ? findGsuidCore(appStateRef.current.services) : undefined;
+      message.error(currentCore?.recentError ?? "Core 启动失败");
+      return false;
     }
     message.warning("Core 已启动，WebConsole 仍在等待；可先查看日志或稍后手动打开");
     return false;
+  }
+
+  function waitForWebconsoleOutcome(timeoutMs: number) {
+    const currentState = appStateRef.current;
+    const currentOutcome = currentState ? getWebconsoleWaitOutcome(currentState) : undefined;
+    if (currentOutcome) {
+      return Promise.resolve(currentOutcome);
+    }
+    return new Promise<WebconsoleWaitOutcome>((resolve) => {
+      const waiter: WebconsoleStateWaiter = {
+        evaluate: getWebconsoleWaitOutcome,
+        resolve,
+        timeoutId: window.setTimeout(() => {
+          webconsoleWaitersRef.current = webconsoleWaitersRef.current.filter((item) => item !== waiter);
+          resolve("timeout");
+        }, timeoutMs),
+      };
+      webconsoleWaitersRef.current.push(waiter);
+    });
   }
 
   async function stopCore() {
@@ -495,12 +587,9 @@ export function useAppController() {
 
   useEffect(() => {
     refreshState().catch((error) => message.error(String(error)));
-    const timer = window.setInterval(() => {
-      void pollHealthState().catch(() => undefined);
-    }, HEALTH_POLL_INTERVAL_MS);
     let cancelled = false;
     const unlisteners: Array<() => void> = [];
-    void subscribeLogs((entry) => enqueueLogs([entry]))
+    void subscribeLogs((entry) => handleLogNotification([entry]))
       .then((unlisten) => {
         if (cancelled) {
           unlisten();
@@ -509,7 +598,25 @@ export function useAppController() {
         unlisteners.push(unlisten);
       })
       .catch(() => undefined);
-    void subscribeLogBatches(enqueueLogs)
+    void subscribeLogBatches(handleLogNotification)
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlisteners.push(unlisten);
+      })
+      .catch(() => undefined);
+    void subscribeStateChanges(() => scheduleStateRefresh())
+      .then((unlisten) => {
+        if (cancelled) {
+          unlisten();
+          return;
+        }
+        unlisteners.push(unlisten);
+      })
+      .catch(() => undefined);
+    void subscribeActionResults(handleActionResult)
       .then((unlisten) => {
         if (cancelled) {
           unlisten();
@@ -521,9 +628,14 @@ export function useAppController() {
     return () => {
       cancelled = true;
       unlisteners.forEach((unlisten) => unlisten());
-      window.clearInterval(timer);
+      if (stateRefreshTimerRef.current !== undefined) window.clearTimeout(stateRefreshTimerRef.current);
       if (logFrameRef.current) window.cancelAnimationFrame(logFrameRef.current);
       if (logFlushTimerRef.current !== undefined) window.clearTimeout(logFlushTimerRef.current);
+      webconsoleWaitersRef.current.forEach((waiter) => {
+        window.clearTimeout(waiter.timeoutId);
+        waiter.resolve("timeout");
+      });
+      webconsoleWaitersRef.current = [];
     };
   }, []);
 
@@ -631,11 +743,79 @@ function shouldDisplayLogs(activeKey: AppSectionKey) {
   return activeKey === "overview" || activeKey === "logs" || activeKey.startsWith("diagnostics_");
 }
 
+function shouldRefreshStateForLog(entry: LogEntry) {
+  return entry.stream === "system" || entry.level === "error";
+}
+
 function coreWebconsoleUrl(core?: ServiceSnapshot) {
   if (!core?.url) return "";
   return `${core.url}/app`;
 }
 
-function delay(ms: number) {
-  return new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+function getWebconsoleWaitOutcome(state: AppState): WebconsoleWaitOutcome | undefined {
+  const nextCore = findGsuidCore(state.services);
+  if (nextCore?.status === "failed") {
+    return "failed";
+  }
+  if (nextCore?.status === "running" && nextCore.webconsoleAvailable) {
+    return "ready";
+  }
+  const waitingTask = state.taskHistory.find(
+    (task) => task.name === "启动 Core" && task.status === "success" && task.stage === "waiting_webconsole",
+  );
+  if (nextCore?.status === "running" && waitingTask) {
+    return "waiting";
+  }
+  return undefined;
+}
+
+function isSourceProbeResults(value: unknown): value is SourceProbeResult[] {
+  return Array.isArray(value) && value.every(isSourceProbeResult);
+}
+
+function isMirrorCheckResults(value: unknown): value is MirrorCheckResult[] {
+  return Array.isArray(value) && value.every(isMirrorCheckResult);
+}
+
+function isNetworkDiagnosticResults(value: unknown): value is NetworkDiagnosticResult[] {
+  return Array.isArray(value) && value.every(isNetworkDiagnosticResult);
+}
+
+function isSourceProbeResult(value: unknown): value is SourceProbeResult {
+  return (
+    isObjectRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.url === "string" &&
+    typeof value.ok === "boolean"
+  );
+}
+
+function isMirrorCheckResult(value: unknown): value is MirrorCheckResult {
+  return (
+    isObjectRecord(value) && typeof value.name === "string" && typeof value.url === "string" && typeof value.ok === "boolean"
+  );
+}
+
+function isNetworkDiagnosticResult(value: unknown): value is NetworkDiagnosticResult {
+  return (
+    isObjectRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.label === "string" &&
+    typeof value.target === "string" &&
+    typeof value.ok === "boolean"
+  );
+}
+
+function isUpdateInfo(value: unknown): value is UpdateInfo {
+  return (
+    isObjectRecord(value) &&
+    typeof value.currentVersion === "string" &&
+    typeof value.hasUpdate === "boolean" &&
+    typeof value.channel === "string"
+  );
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

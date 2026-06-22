@@ -38,7 +38,6 @@ export function InstallGuide(props: InstallGuideProps) {
         </div>
         <div className="install-guide-scroll">
           <div className="install-guide-body">
-            <Alert type="info" showIcon title="按顺序完成网络、源码、镜像、初始化和启动；失败时先看日志，再做修复。" />
             <div className="guide-run-all">
               <div>
                 <strong>一键初始化</strong>

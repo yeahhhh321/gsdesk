@@ -1,15 +1,8 @@
 import { Alert, App as AntdApp, Button, Tag } from "antd";
-import { AlertTriangle, CheckCircle2, Download, FileArchive, FolderOpen, Wrench } from "lucide-react";
+import { AlertTriangle, CheckCircle2, FileArchive, Wrench } from "lucide-react";
 import { WidePanel } from "../ui/pageTabs";
 import { PanelHeader, SectionActions } from "../ui/primitives";
-import {
-  buildLogFailureSummary,
-  buildTroubleshootingItems,
-  severityColor,
-  severityLabel,
-  updateDescription,
-  updateMessage,
-} from "./diagnosticsRules";
+import { buildLogFailureSummary, buildTroubleshootingItems, severityColor, severityLabel } from "./diagnosticsRules";
 import type { AppState, LogEntry, UpdateInfo } from "../types";
 
 export type DiagnosticsSection = "export" | "failures";
@@ -21,9 +14,6 @@ interface DiagnosticsPageProps {
   updateInfo?: UpdateInfo;
   loadingAction?: string;
   onExportDiagnostics: () => Promise<string | undefined>;
-  onCheckShellUpdate: () => void;
-  onInstallShellUpdate: () => void;
-  onOpenDiagnosticsDir: () => void;
 }
 
 export default function DiagnosticsPage({
@@ -33,9 +23,6 @@ export default function DiagnosticsPage({
   updateInfo,
   loadingAction,
   onExportDiagnostics,
-  onCheckShellUpdate,
-  onInstallShellUpdate,
-  onOpenDiagnosticsDir,
 }: DiagnosticsPageProps) {
   const { modal } = AntdApp.useApp();
   const troubleshootingItems = buildTroubleshootingItems(appState, updateInfo);
@@ -45,7 +32,7 @@ export default function DiagnosticsPage({
     return (
       <section className="page-grid">
         <WidePanel>
-          <PanelHeader title="诊断与更新" description="导出诊断包、检查壳更新、打开诊断目录" />
+          <PanelHeader title="诊断导出" description="生成本机诊断包，敏感字段会遮蔽" />
           <p className="muted-block">
             诊断包只保存在本机 diagnostics 目录；版本、系统、路径、端口、网络摘要和最近日志会写入包内，敏感字段会遮蔽。
           </p>
@@ -61,40 +48,7 @@ export default function DiagnosticsPage({
             >
               导出诊断包
             </Button>
-            <Button icon={<Download size={16} />} loading={loadingAction === "update"} onClick={onCheckShellUpdate}>
-              检查壳更新
-            </Button>
-            {updateInfo?.hasUpdate && (
-              <Button
-                type="primary"
-                icon={<Download size={16} />}
-                loading={loadingAction === "install_shell_update"}
-                onClick={() =>
-                  modal.confirm({
-                    title: "下载并安装 GSDesk 更新",
-                    content: "更新会下载官方 GitHub Release 产物，完成签名校验后安装并重启 GSDesk。",
-                    okText: "安装更新",
-                    cancelText: "取消",
-                    onOk: onInstallShellUpdate,
-                  })
-                }
-              >
-                下载并安装
-              </Button>
-            )}
-            <Button icon={<FolderOpen size={16} />} onClick={onOpenDiagnosticsDir}>
-              打开诊断目录
-            </Button>
           </SectionActions>
-          {updateInfo && (
-            <Alert
-              className="spaced"
-              type={updateInfo.hasUpdate ? "warning" : updateInfo.error ? "warning" : "info"}
-              showIcon
-              title={updateMessage(updateInfo)}
-              description={updateDescription(updateInfo)}
-            />
-          )}
         </WidePanel>
       </section>
     );

@@ -1,22 +1,12 @@
 import type { ReactNode } from "react";
-import { Alert, Badge, Button, Progress, Tag, Typography } from "antd";
+import { Alert, Button, Typography } from "antd";
 import { ExternalLink, ListChecks, Play, Square, Terminal, Wrench } from "lucide-react";
-import { displayBytes, displayNumber, displaySecondsFromMilliseconds, displayText } from "../ui/format";
+import { displayNumber, displaySecondsFromMilliseconds, displayText } from "../ui/format";
 import { PanelHeader, SectionActions } from "../ui/primitives";
 import { statusText } from "../ui/status";
 import { PreflightStatusTag, StatusTag, TaskStatusTag } from "../ui/statusTags";
 import { isBeginnerMode } from "../ui/userMode";
-import type {
-  AppPaths,
-  AppState,
-  LogEntry,
-  PreflightCheck,
-  ServiceSnapshot,
-  ServiceStatus,
-  Settings,
-  TaskRecord,
-  ToolchainInfo,
-} from "../types";
+import type { AppState, PreflightCheck, ServiceSnapshot, ServiceStatus, Settings, TaskRecord, ToolchainInfo } from "../types";
 import type { SetupProgressItem } from "../ui/setupProgress";
 
 const { Text } = Typography;
@@ -24,8 +14,6 @@ const { Text } = Typography;
 interface OverviewPageProps {
   appState?: AppState;
   core?: ServiceSnapshot;
-  logs: LogEntry[];
-  healthScore: number;
   setupChecklist: SetupProgressItem[];
   loadingAction?: string;
   onStartCore: () => void;
@@ -36,11 +24,12 @@ interface OverviewPageProps {
   onOpenLogs: () => void;
 }
 
+const PREFLIGHT_LIMIT = 4;
+const TASK_LIMIT = 2;
+
 export default function OverviewPage({
   appState,
   core,
-  logs,
-  healthScore,
   setupChecklist,
   loadingAction,
   onStartCore,
@@ -52,20 +41,18 @@ export default function OverviewPage({
 }: OverviewPageProps) {
   const coreStatus = core?.status ?? "uninitialized";
   const beginnerMode = isBeginnerMode(appState?.settings);
-  const preflightChecks = appState?.preflightChecks;
-  const blockingChecks = preflightChecks ? preflightChecks.filter((check) => check.status === "block") : [];
-  const warningChecks = preflightChecks ? preflightChecks.filter((check) => check.status === "warn") : [];
-  const portPolicy = appState?.settings.preferredCorePort ? `固定 ${appState.settings.preferredCorePort}` : "自动";
-  const services = appState?.services ?? [];
+  const preflightChecks = appState?.preflightChecks ?? [];
+  const blockingChecks = preflightChecks.filter((check) => check.status === "block");
+  const warningChecks = preflightChecks.filter((check) => check.status === "warn");
+  const visiblePreflight = sortPreflightChecks(preflightChecks);
+  const actionablePreflight = visiblePreflight.filter((check) => check.status !== "ok");
+  const compactPreflight = (actionablePreflight.length ? actionablePreflight : visiblePreflight).slice(0, PREFLIGHT_LIMIT);
+  const hiddenPreflightCount = Math.max(visiblePreflight.length - compactPreflight.length, 0);
   const taskHistory = appState?.taskHistory ?? [];
-  const visiblePreflight = sortPreflightChecks(appState?.preflightChecks ?? []);
-  const recentLogs = logs.slice(-8).reverse();
-  const settingsItems = appState
-    ? beginnerMode
-      ? createBeginnerSettingsItems(appState.settings, appState.paths, appState.toolchain)
-      : createSettingsItems(appState.settings, appState.paths, appState.toolchain)
-    : [];
-  const pathItems = appState ? createPathItems(appState.paths, appState.toolchain) : [];
+  const compactTasks = taskHistory.slice(0, TASK_LIMIT);
+  const hiddenTaskCount = Math.max(taskHistory.length - compactTasks.length, 0);
+  const portPolicy = appState?.settings.preferredCorePort ? `固定 ${appState.settings.preferredCorePort}` : "自动";
+  const settingsItems = appState ? createSettingsItems(appState.settings, appState.toolchain, beginnerMode) : [];
   const lifecycleAction = getLifecycleAction(coreStatus);
   const lifecycleLoading = Boolean(lifecycleAction.loadingKey && loadingAction === lifecycleAction.loadingKey);
   const runLifecycleAction = lifecycleAction.kind === "stop" ? onStopCore : onStartCore;
@@ -73,8 +60,8 @@ export default function OverviewPage({
     core,
     coreStatus,
     blockingChecks,
-    runningTask: appState?.taskHistory.find((task) => task.status === "running"),
-    failedTask: appState?.taskHistory.find((task) => task.status === "failed"),
+    runningTask: taskHistory.find((task) => task.status === "running"),
+    failedTask: taskHistory.find((task) => task.status === "failed"),
     onStartCore,
     onOpenWebconsole,
     onOpenInstallGuide,
@@ -83,14 +70,58 @@ export default function OverviewPage({
   });
 
   return (
-    <section className="overview-dashboard">
-      <div className="wide-panel overview-core-panel">
+    <section className="overview-dashboard overview-dashboard-compact">
+      <div className="wide-panel overview-control-strip">
         <PanelHeader
           title="Gsuid Core 总控"
-          description="启动、停止、WebConsole 和本机运行状态"
+          description="只保留启动判断、阻断项、当前任务和关键入口"
           actions={<StatusTag status={coreStatus} />}
         />
-        {core?.recentError && <Alert type="error" showIcon title={core.recentError} className="spaced" />}
+        <div className="overview-control-grid">
+          <div className="overview-primary-state">
+            <Text type="secondary">当前状态</Text>
+            <strong>{statusText[coreStatus]}</strong>
+            <small>{core?.healthOk ? "WebConsole 健康检查通过" : "启动后自动检查 WebConsole"}</small>
+          </div>
+          <div className="overview-compact-status-grid">
+            <OverviewMetric label="端口" value={displayNumber(core?.port, "未分配")} detail={portPolicy} />
+            <OverviewMetric
+              label="WebConsole"
+              value={core?.webconsoleAvailable ? "可访问" : "未就绪"}
+              detail={displayText(core?.url, "启动后生成")}
+            />
+            <OverviewMetric
+              label="预检"
+              value={preflightSummary(blockingChecks.length, warningChecks.length)}
+              detail={visiblePreflight.length ? "按阻断优先排序" : "等待状态刷新"}
+            />
+            <OverviewMetric
+              label="Commit"
+              value={displayText(core?.currentCommit, "-")}
+              detail={displayText(core?.currentTag, "无 tag")}
+            />
+            <OverviewMetric label="工具链" value={toolchainStatus(appState)} detail={toolchainDetail(appState)} />
+            <OverviewMetric
+              label="任务"
+              value={taskStatusSummary(taskHistory)}
+              detail={taskHistory[0] ? taskHistory[0].name : "暂无任务"}
+            />
+          </div>
+          <SectionActions>
+            <Button
+              type={lifecycleAction.kind === "start" ? "primary" : "default"}
+              icon={lifecycleAction.kind === "stop" ? <Square size={16} /> : <Play size={16} />}
+              loading={lifecycleLoading}
+              disabled={lifecycleAction.disabled}
+              onClick={runLifecycleAction}
+            >
+              {lifecycleAction.label}
+            </Button>
+            <Button icon={<ExternalLink size={16} />} loading={loadingAction === "open_webconsole"} onClick={onOpenWebconsole}>
+              打开 WebConsole
+            </Button>
+          </SectionActions>
+        </div>
         {nextAction && (
           <Alert
             className="overview-next-action"
@@ -112,168 +143,50 @@ export default function OverviewPage({
             }
           />
         )}
-        <div className="core-summary-row">
-          <div className="core-state-card">
-            <Text type="secondary">当前状态</Text>
-            <strong>{statusText[coreStatus]}</strong>
-            <small>{core?.healthOk ? "WebConsole 健康检查通过" : "启动后自动检查 WebConsole"}</small>
-          </div>
-          <div className="core-port-card">
-            <Text type="secondary">端口</Text>
-            <strong>{displayNumber(core?.port, "未分配")}</strong>
-            <small>策略：{portPolicy}</small>
-          </div>
-          <div className="core-url-card">
-            <Text type="secondary">运行地址</Text>
-            <strong>{displayText(core?.url, "启动后生成")}</strong>
-            <small>{core?.webconsoleAvailable ? "WebConsole 可访问" : "WebConsole 未就绪"}</small>
-          </div>
-        </div>
-        <div className="overview-metrics">
-          <div>
-            <Text type="secondary">进程</Text>
-            <strong>{displayNumber(core?.pid, "-")}</strong>
-          </div>
-          <div>
-            <Text type="secondary">Core 内存</Text>
-            <strong>{displayBytes(core?.memoryBytes)}</strong>
-          </div>
-          <div>
-            <Text type="secondary">壳进程</Text>
-            <strong>{displayNumber(appState?.shell.pid, "-")}</strong>
-          </div>
-          <div>
-            <Text type="secondary">壳内存</Text>
-            <strong>{displayBytes(appState?.shell.memoryBytes)}</strong>
-          </div>
-          <div>
-            <Text type="secondary">WebConsole</Text>
-            <strong>{core?.webconsoleAvailable ? "可访问" : "未就绪"}</strong>
-          </div>
-          <div>
-            <Text type="secondary">Commit</Text>
-            <strong>{displayText(core?.currentCommit, "-")}</strong>
-          </div>
-          <div>
-            <Text type="secondary">Tag</Text>
-            <strong>{displayText(core?.currentTag, "-")}</strong>
-          </div>
-        </div>
-        <SectionActions>
-          <Button
-            type={lifecycleAction.kind === "start" ? "primary" : "default"}
-            icon={lifecycleAction.kind === "stop" ? <Square size={16} /> : <Play size={16} />}
-            loading={lifecycleLoading}
-            disabled={lifecycleAction.disabled}
-            onClick={runLifecycleAction}
-          >
-            {lifecycleAction.label}
-          </Button>
-          <Button icon={<ExternalLink size={16} />} loading={loadingAction === "open_webconsole"} onClick={onOpenWebconsole}>
-            打开 WebConsole
-          </Button>
-        </SectionActions>
       </div>
-      <div className="wide-panel overview-health-panel">
+
+      <div className="wide-panel overview-preflight-panel overview-compact-panel">
         <PanelHeader
-          title="健康检查"
-          description="只保留影响启动和排查的状态摘要"
-          actions={<Text type="secondary">{healthScore}%</Text>}
-        />
-        <div className="health-overview">
-          <Progress percent={healthScore} size="small" showInfo={false} />
-          <div className="health-list compact">
-            <Badge
-              status={appState?.uvDetected ? "success" : "error"}
-              text={appState?.uvDetected ? `uv 可用 / ${appState.toolchain.uvSource}` : "未检测到 uv"}
-            />
-            <Badge
-              status={appState?.toolchain.gitDetected ? "success" : "error"}
-              text={
-                appState?.toolchain.gitDetected ? `源码工具可用 / ${gitSourceText(appState.toolchain.gitSource)}` : "缺少源码工具"
-              }
-            />
-            <Badge
-              status={blockingChecks.length ? "error" : "success"}
-              text={blockingChecks.length ? `${blockingChecks.length} 个阻断项` : "预检无阻断"}
-            />
-            <Badge
-              status={warningChecks.length ? "warning" : "success"}
-              text={warningChecks.length ? `${warningChecks.length} 个警告项` : "预检无警告"}
-            />
-            <Badge status={core?.healthOk ? "success" : "default"} text={core?.healthOk ? "Core 健康" : "Core 未运行"} />
-          </div>
-        </div>
-      </div>
-      {!beginnerMode && (
-        <div className="wide-panel overview-service-panel">
-          <PanelHeader title="服务状态" description="所有纳入 GSDesk 管理或预留的服务快照" />
-          <div className="overview-service-list">
-            {services.map((service) => (
-              <div className="overview-service-item" key={service.serviceId}>
-                <div>
-                  <strong>{service.name}</strong>
-                  <small>{service.serviceId}</small>
-                </div>
-                <StatusTag status={service.status} />
-                <span>{displayNumber(service.pid, "-")}</span>
-                <span>{displayNumber(service.port, "-")}</span>
-                <span>{displayBytes(service.memoryBytes)}</span>
-                <code>{displayText(service.url, "-")}</code>
-                {service.recentError && <p>{service.recentError}</p>}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-      <div className="wide-panel overview-preflight-panel">
-        <PanelHeader
-          title="预检明细"
-          description="系统、工具链、端口、权限、磁盘、Core 源码和 venv"
+          title="预检与阻断项"
           actions={
             <Button icon={<Wrench size={16} />} onClick={onOpenEnvironment}>
-              处理预检
+              处理
             </Button>
           }
         />
         <div className="overview-check-list">
-          {visiblePreflight.map((check) => (
+          {compactPreflight.map((check) => (
             <div className={`overview-check-item ${check.status}`} key={check.id}>
               <div>
                 <strong>{check.label}</strong>
-                <p>{check.detail}</p>
-                {check.action && <small>{check.action}</small>}
+                <p>{displayText(check.action, check.detail)}</p>
               </div>
               <PreflightStatusTag status={check.status} />
             </div>
           ))}
+          {!compactPreflight.length && <p className="muted-block">等待预检结果。</p>}
+          {hiddenPreflightCount > 0 && (
+            <p className="overview-more-line">另有 {hiddenPreflightCount} 项通过或在环境预检页查看。</p>
+          )}
         </div>
       </div>
-      <div className="wide-panel overview-settings-panel">
-        <PanelHeader
-          title={beginnerMode ? "当前自动配置" : "网络与策略"}
-          description={beginnerMode ? "小白模式使用自动源、自动镜像、自动端口和托管目录" : "源码源、PyPI、端口、代理和启动策略"}
-        />
+
+      <div className="wide-panel overview-settings-panel overview-compact-panel">
+        <PanelHeader title={beginnerMode ? "当前自动配置" : "网络与策略"} />
         <OverviewInfoGrid items={settingsItems} />
       </div>
-      {!beginnerMode && (
-        <div className="wide-panel overview-path-panel">
-          <PanelHeader title="运行路径" description="当前生效的 Core、venv、uv、日志、诊断和备份目录" />
-          <OverviewInfoGrid items={pathItems} code />
-        </div>
-      )}
-      <div className="wide-panel overview-task-panel">
+
+      <div className="wide-panel overview-task-panel overview-compact-panel">
         <PanelHeader
           title="任务历史"
-          description="初始化、启动、停止、修复和更新动作"
           actions={
             <Button icon={<ListChecks size={16} />} onClick={onOpenEnvironment}>
-              查看任务
+              查看
             </Button>
           }
         />
         <div className="overview-task-list">
-          {taskHistory.map((task) => (
+          {compactTasks.map((task) => (
             <div className="overview-task-item" key={task.id}>
               <TaskStatusTag status={task.status} />
               <div>
@@ -286,37 +199,14 @@ export default function OverviewPage({
               <span>{displaySecondsFromMilliseconds(task.elapsedMs, task.status === "running" ? "进行中" : "-")}</span>
             </div>
           ))}
-          {!taskHistory.length && <p className="muted-block">暂无任务记录。</p>}
+          {!compactTasks.length && <p className="muted-block">暂无任务记录。</p>}
+          {hiddenTaskCount > 0 && <p className="overview-more-line">还有 {hiddenTaskCount} 条任务在任务历史页查看。</p>}
         </div>
       </div>
-      {!beginnerMode && (
-        <div className="wide-panel overview-log-panel">
-          <PanelHeader
-            title="最近 Core 日志"
-            description="首页只保留最近几条，完整 JSONL 在日志页查看"
-            actions={
-              <Button icon={<Terminal size={16} />} onClick={onOpenLogs}>
-                打开日志
-              </Button>
-            }
-          />
-          <div className="overview-log-list">
-            {recentLogs.map((entry) => (
-              <div className={`overview-log-item ${entry.level}`} key={entry.id}>
-                <time>{formatTime(entry.timestamp)}</time>
-                <Tag>{entry.level}</Tag>
-                <span>{displayText(entry.module, entry.stream)}</span>
-                <code>{displayText(entry.message, entry.line)}</code>
-              </div>
-            ))}
-            {!recentLogs.length && <p className="muted-block">暂无 Core JSONL 日志。</p>}
-          </div>
-        </div>
-      )}
-      <div className="wide-panel overview-guide-panel">
+
+      <div className="wide-panel overview-guide-panel overview-compact-panel">
         <PanelHeader
           title="首次安装引导"
-          description="网络、源码、镜像、初始化、启动和 WebConsole 一条线完成"
           actions={
             <Button type="primary" icon={<Wrench size={16} />} onClick={() => onOpenInstallGuide(0)}>
               打开引导
@@ -342,19 +232,35 @@ export default function OverviewPage({
   );
 }
 
+interface OverviewMetricProps {
+  label: string;
+  value: ReactNode;
+  detail?: ReactNode;
+}
+
+function OverviewMetric({ label, value, detail }: OverviewMetricProps) {
+  return (
+    <div className="overview-metric-cell">
+      <Text type="secondary">{label}</Text>
+      <strong>{value}</strong>
+      {detail && <small>{detail}</small>}
+    </div>
+  );
+}
+
 interface OverviewInfoItem {
   label: string;
   value: ReactNode;
   detail?: ReactNode;
 }
 
-function OverviewInfoGrid({ items, code = false }: { items: OverviewInfoItem[]; code?: boolean }) {
+function OverviewInfoGrid({ items }: { items: OverviewInfoItem[] }) {
   return (
     <div className="overview-info-grid">
       {items.map((item) => (
         <div className="overview-info-item" key={item.label}>
           <Text type="secondary">{item.label}</Text>
-          {code ? <code>{item.value}</code> : <strong>{item.value}</strong>}
+          <strong>{item.value}</strong>
           {item.detail && <small>{item.detail}</small>}
         </div>
       ))}
@@ -362,78 +268,49 @@ function OverviewInfoGrid({ items, code = false }: { items: OverviewInfoItem[]; 
   );
 }
 
-function createSettingsItems(settings: Settings, paths: AppPaths, toolchain: ToolchainInfo): OverviewInfoItem[] {
+function createSettingsItems(settings: Settings, toolchain: ToolchainInfo, beginnerMode: boolean): OverviewInfoItem[] {
+  if (beginnerMode) {
+    return [
+      { label: "使用模式", value: "小白模式", detail: "只显示直接可用的操作" },
+      {
+        label: "源码工具",
+        value: toolchain.gitDetected ? "已准备好" : "当前安装包不完整",
+        detail: toolchain.gitDetected ? gitSourceText(toolchain.gitSource) : displayText(toolchain.gitError, "缺少内置 Git"),
+      },
+      {
+        label: "下载源",
+        value: sourceModeText(settings.sourceMode),
+        detail: displayText(settings.selectedSource, "自动选择可用源"),
+      },
+      { label: "PyPI", value: pypiModeText(settings.pypiIndexMode), detail: displayText(settings.pypiIndexUrl, "自动选择镜像") },
+      {
+        label: "端口",
+        value: settings.preferredCorePort ? `固定 ${settings.preferredCorePort}` : "自动选择",
+        detail: settings.preferredCorePort ? "高级设置仍在生效" : "默认从 8765 开始",
+      },
+      { label: "关闭窗口", value: settings.hideToTrayOnClose ? "隐藏到托盘" : "退出 GSDesk" },
+    ];
+  }
+
   return [
     {
       label: "源码工具",
       value: toolchain.gitDetected ? gitSourceText(toolchain.gitSource) : "不可用",
       detail: toolchain.gitDetected ? displayText(toolchain.gitVersion, "Git 可用") : displayText(toolchain.gitError, "缺少 Git"),
     },
-    {
-      label: "源码策略",
-      value: sourceModeText(settings.sourceMode),
-      detail: displayText(settings.selectedSource, "未设置源码源"),
-    },
-    {
-      label: "Core 源码路径",
-      value: displayText(paths.coreDir, "-"),
-      detail: displayText(settings.customCoreDir, "使用 GSDesk 托管目录"),
-    },
-    { label: "PyPI 策略", value: pypiModeText(settings.pypiIndexMode), detail: displayText(settings.pypiIndexUrl, "未设置镜像") },
-    {
-      label: "端口策略",
-      value: settings.preferredCorePort ? `固定 ${settings.preferredCorePort}` : "自动选择",
-      detail: settings.preferredCorePort ? "启动时严格使用该端口" : "自动选择 8765-8865",
-    },
-    { label: "HTTP_PROXY", value: displayText(settings.proxy.httpProxy, "未设置") },
-    { label: "HTTPS_PROXY", value: displayText(settings.proxy.httpsProxy, "未设置") },
-    { label: "ALL_PROXY", value: displayText(settings.proxy.allProxy, "未设置") },
-    { label: "NO_PROXY", value: displayText(settings.proxy.noProxy, "未设置") },
-    { label: "点击 X", value: settings.hideToTrayOnClose ? "隐藏到托盘" : "退出 GSDesk" },
-    { label: "退出时关闭 Core", value: settings.closeCoreOnExit ? "关闭" : "后台保留" },
-    { label: "启动检查壳更新", value: settings.autoCheckUpdate ? "开启" : "关闭" },
-  ];
-}
-
-function createBeginnerSettingsItems(settings: Settings, paths: AppPaths, toolchain: ToolchainInfo): OverviewInfoItem[] {
-  return [
-    { label: "使用模式", value: "小白模式", detail: "只显示直接可用的操作" },
-    {
-      label: "源码工具",
-      value: toolchain.gitDetected ? "已准备好" : "当前安装包不完整",
-      detail: toolchain.gitDetected ? "无需单独安装 Git" : displayText(toolchain.gitError, "缺少内置 Git"),
-    },
-    { label: "源码与下载源", value: "自动选择", detail: "网络检测后自动保存可用源" },
-    {
-      label: "Core 目录",
-      value: settings.customCoreDir.trim().length ? "保留高级自定义" : "GSDesk 托管",
-      detail: settings.customCoreDir.trim().length ? settings.customCoreDir : paths.coreDir,
-    },
+    { label: "源码源", value: sourceModeText(settings.sourceMode), detail: displayText(settings.selectedSource, "未设置源码源") },
+    { label: "PyPI", value: pypiModeText(settings.pypiIndexMode), detail: displayText(settings.pypiIndexUrl, "未设置镜像") },
     {
       label: "端口",
       value: settings.preferredCorePort ? `固定 ${settings.preferredCorePort}` : "自动选择",
-      detail: settings.preferredCorePort ? "高级设置仍在生效" : "默认从 8765 开始寻找可用端口",
+      detail: settings.preferredCorePort ? "启动时严格使用该端口" : "自动选择 8765-8865",
     },
-    { label: "关闭窗口", value: settings.hideToTrayOnClose ? "隐藏到托盘" : "退出 GSDesk" },
-    { label: "退出时 Core", value: settings.closeCoreOnExit ? "停止 Core" : "后台保留" },
-  ];
-}
-
-function createPathItems(paths: AppPaths, toolchain: ToolchainInfo): OverviewInfoItem[] {
-  return [
-    { label: "AppData", value: paths.appData },
-    { label: "Runtime", value: paths.runtime },
-    { label: "Tools", value: paths.toolsDir },
-    { label: "Core", value: paths.coreDir },
-    { label: "venv", value: paths.venvDir },
-    { label: "uv cache", value: paths.uvCacheDir },
-    { label: "uv Python", value: paths.uvPythonDir },
-    { label: "uv executable", value: paths.uvExecutable },
-    { label: "Git executable", value: displayText(toolchain.gitPath, "-") },
-    { label: "Logs", value: paths.logsDir },
-    { label: "Diagnostics", value: paths.diagnosticsDir },
-    { label: "Backups", value: paths.backupsDir },
-    { label: "Settings", value: paths.settingsFile },
+    { label: "代理", value: proxySummary(settings.proxy), detail: "HTTP / HTTPS / ALL / NO_PROXY" },
+    {
+      label: "退出时 Core",
+      value: settings.closeCoreOnExit ? "关闭" : "后台保留",
+      detail: settings.hideToTrayOnClose ? "窗口隐藏到托盘" : "窗口关闭即退出",
+    },
   ];
 }
 
@@ -445,6 +322,34 @@ function preflightPriority(status: PreflightCheck["status"]) {
   if (status === "block") return 0;
   if (status === "warn") return 1;
   return 2;
+}
+
+function preflightSummary(blockingCount: number, warningCount: number) {
+  if (blockingCount > 0) return `${blockingCount} 阻断`;
+  if (warningCount > 0) return `${warningCount} 警告`;
+  return "无阻断";
+}
+
+function taskStatusSummary(tasks: TaskRecord[]) {
+  const runningTask = tasks.find((task) => task.status === "running");
+  if (runningTask) return "进行中";
+  const failedTask = tasks.find((task) => task.status === "failed");
+  if (failedTask) return "有失败";
+  if (tasks.length > 0) return "已记录";
+  return "暂无";
+}
+
+function toolchainStatus(appState?: AppState) {
+  if (!appState) return "等待刷新";
+  if (appState.uvDetected && appState.toolchain.gitDetected) return "已就绪";
+  return "需处理";
+}
+
+function toolchainDetail(appState?: AppState) {
+  if (!appState) return "uv / Git";
+  const uvText = appState.uvDetected ? "uv 可用" : "uv 缺失";
+  const gitText = appState.toolchain.gitDetected ? "Git 可用" : "Git 缺失";
+  return `${uvText} · ${gitText}`;
 }
 
 function sourceModeText(value: Settings["sourceMode"]) {
@@ -464,6 +369,16 @@ function gitSourceText(value?: string) {
 function pypiModeText(value: Settings["pypiIndexMode"]) {
   if (value === "manual") return "手动锁定";
   return "自动选择";
+}
+
+function proxySummary(proxy: Settings["proxy"]) {
+  const values = [proxy.httpProxy, proxy.httpsProxy, proxy.allProxy, proxy.noProxy];
+  let configuredCount = 0;
+  for (const value of values) {
+    if (displayText(value, "").length > 0) configuredCount += 1;
+  }
+  if (configuredCount > 0) return `${configuredCount} 项已设置`;
+  return "未设置";
 }
 
 function formatTime(value?: string) {

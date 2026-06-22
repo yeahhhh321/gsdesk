@@ -20,6 +20,19 @@ import type {
   UpdateInstallResult,
 } from "./types";
 
+export interface AppStateChangedEvent {
+  reason: string;
+  emittedAt: string;
+}
+
+export interface ActionResultEvent {
+  action: string;
+  ok: boolean;
+  result?: unknown;
+  error?: string;
+  emittedAt: string;
+}
+
 export async function command<T>(name: string, args?: Record<string, unknown>): Promise<T> {
   if (!isTauriRuntime()) {
     return previewCommand<T>(name, args);
@@ -76,6 +89,20 @@ export function subscribeLogBatches(handler: (entries: LogEntry[]) => void): Pro
     return Promise.resolve(() => undefined);
   }
   return listen<LogEntry[]>("gsdesk-log-batch", (event) => handler(event.payload));
+}
+
+export function subscribeStateChanges(handler: (event: AppStateChangedEvent) => void): Promise<() => void> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(() => undefined);
+  }
+  return listen<AppStateChangedEvent>("gsdesk-state-changed", (event) => handler(event.payload));
+}
+
+export function subscribeActionResults(handler: (event: ActionResultEvent) => void): Promise<() => void> {
+  if (!isTauriRuntime()) {
+    return Promise.resolve(() => undefined);
+  }
+  return listen<ActionResultEvent>("gsdesk-action-result", (event) => handler(event.payload));
 }
 
 function isTauriRuntime() {

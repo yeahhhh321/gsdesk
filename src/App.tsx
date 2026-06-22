@@ -13,6 +13,7 @@ const OverviewPage = lazy(() => import("./pages/OverviewPage"));
 const WebconsolePage = lazy(() => import("./pages/WebconsolePage"));
 const LogsPage = lazy(() => import("./pages/LogsPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
+const ShellUpdatePage = lazy(() => import("./pages/ShellUpdatePage"));
 const EnvironmentPage = lazy(() => import("./pages/EnvironmentPage"));
 const NetworkPage = lazy(() => import("./pages/NetworkPage"));
 const DiagnosticsPage = lazy(() => import("./pages/DiagnosticsPage"));
@@ -30,8 +31,6 @@ function App() {
           <OverviewPage
             appState={controller.appState}
             core={controller.core}
-            logs={controller.visibleLogs}
-            healthScore={controller.healthScore}
             setupChecklist={controller.setupChecklist}
             loadingAction={controller.loadingAction}
             onStartCore={controller.startCore}
@@ -54,7 +53,6 @@ function App() {
             onStartCore={controller.startCore}
             onOpenInstallGuide={controller.openInstallGuide}
             onOpenLogs={() => controller.setActiveKey("logs")}
-            onOpenEnvironment={() => controller.setActiveKey("environment_runtime")}
           />
         );
       case "logs":
@@ -64,18 +62,21 @@ function App() {
         return (
           <SettingsPage
             appState={controller.appState}
-            updateInfo={controller.updateInfo}
             loadingAction={controller.loadingAction}
             onSaveSettings={controller.saveSettings}
+          />
+        );
+      case "shell_update":
+        return (
+          <ShellUpdatePage
+            updateInfo={controller.updateInfo}
+            loadingAction={controller.loadingAction}
             onCheckShellUpdate={controller.checkShellUpdate}
             onInstallShellUpdate={controller.installShellUpdate}
-            onExportSettings={controller.exportSettings}
-            onImportSettings={controller.importSettings}
-            onOpenPath={controller.openPath}
-            onOpenInstallGuide={() => controller.openInstallGuide(0)}
           />
         );
       case "environment_runtime":
+      case "environment_repair":
       case "environment_update":
       case "environment_data":
       case "environment_tasks":
@@ -94,8 +95,6 @@ function App() {
             onRetryTask={controller.retryTask}
             onCreateRuntimeBackup={controller.createRuntimeBackup}
             onRestoreRuntimeBackup={controller.restoreRuntimeBackup}
-            onExportSettings={controller.exportSettings}
-            onImportSettings={controller.importSettings}
             onClearAppData={controller.clearAppData}
             onRefreshState={controller.refreshState}
           />
@@ -128,9 +127,6 @@ function App() {
             updateInfo={controller.updateInfo}
             loadingAction={controller.loadingAction}
             onExportDiagnostics={controller.exportDiagnostics}
-            onCheckShellUpdate={controller.checkShellUpdate}
-            onInstallShellUpdate={controller.installShellUpdate}
-            onOpenDiagnosticsDir={() => controller.openPath("diagnosticsDir")}
           />
         );
       default:
@@ -196,6 +192,7 @@ function networkSection(route: AppSectionKey): NetworkSection {
 }
 
 function environmentSection(route: AppSectionKey): EnvironmentSection {
+  if (route === "environment_repair") return "repair";
   if (route === "environment_update") return "update";
   if (route === "environment_data") return "data";
   if (route === "environment_tasks") return "tasks";

@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Alert, Button, Form, Input, InputNumber, Radio, Table, Typography } from "antd";
+import { Button, Form, Input, InputNumber, Radio, Table, Typography } from "antd";
 import { Activity } from "lucide-react";
 import { displayText } from "../ui/format";
 import { WidePanel } from "../ui/pageTabs";
@@ -43,27 +43,7 @@ export default function NetworkPage({
       return (
         <section className="page-grid">
           <WidePanel>
-            <PanelHeader
-              title="网络设置"
-              description="小白模式下使用自动源、自动镜像、自动端口和 GSDesk 托管目录"
-              actions={
-                <SectionActions>
-                  <Button icon={<Activity size={16} />} loading={loadingAction === "probe_sources"} onClick={onProbeSources}>
-                    检查源码源
-                  </Button>
-                  <Button icon={<Activity size={16} />} loading={loadingAction === "check_mirrors"} onClick={onCheckMirrors}>
-                    测速下载源
-                  </Button>
-                </SectionActions>
-              }
-            />
-            <Alert
-              type="info"
-              showIcon
-              className="spaced"
-              message="不用手动填地址"
-              description="GSDesk 会自动选择可用源码源、PyPI 镜像和 Core 端口。需要固定端口、代理、自定义 Core 路径或锁定镜像时，在设置页关闭小白模式。"
-            />
+            <PanelHeader title="网络设置" description="小白模式下使用自动源、自动镜像、自动端口和 GSDesk 托管目录" />
             <div className="settings-summary-grid">
               <SummaryItem label="源码源" value={sourceModeText(appState.settings.sourceMode)} detail="默认自动选择可用源" />
               <SummaryItem label="PyPI 镜像" value={pypiModeText(appState.settings.pypiIndexMode)} detail="测速后保存可用镜像" />

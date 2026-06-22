@@ -3,7 +3,7 @@ import { Badge, Button, Layout, Menu, Tooltip, Typography } from "antd";
 import { PanelLeftClose, PanelLeftOpen, RefreshCcw } from "lucide-react";
 import type { ServiceStatus } from "../types";
 import appIconUrl from "../assets/genshinuid-icon.png";
-import { navItemsForMode, routeParentKey, sectionMeta, type AppNavGroupKey, type AppSectionKey } from "./appSections";
+import { navItemsForMode, sectionMeta, type AppSectionKey } from "./appSections";
 import { displayText } from "./format";
 import { statusText } from "./status";
 
@@ -20,11 +20,8 @@ interface AppSidebarProps {
 
 export function AppSidebar({ activeKey, coreStatus, version, beginnerMode, onSelect }: AppSidebarProps) {
   const [collapsed, setCollapsed] = useState(false);
-  const [manualOpenKeys, setManualOpenKeys] = useState<AppNavGroupKey[]>([]);
   const toggleLabel = collapsed ? "展开侧边栏" : "收起侧边栏";
   const statusLabel = `Core ${statusText[coreStatus]} / v${displayText(version, "0.1.0")}`;
-  const activeParentKey = routeParentKey[activeKey];
-  const openKeys = collapsed ? [] : uniqueOpenKeys(manualOpenKeys, activeParentKey);
 
   return (
     <Sider width={224} collapsedWidth={72} collapsed={collapsed} trigger={null} className="sidebar">
@@ -40,9 +37,7 @@ export function AppSidebar({ activeKey, coreStatus, version, beginnerMode, onSel
       <Menu
         mode="inline"
         inlineCollapsed={collapsed}
-        openKeys={openKeys}
         selectedKeys={[activeKey]}
-        onOpenChange={(keys) => setManualOpenKeys(keys.filter(isNavGroupKey))}
         onSelect={({ key }) => onSelect(key as AppSectionKey)}
         items={navItemsForMode(beginnerMode)}
       />
@@ -69,16 +64,6 @@ export function AppSidebar({ activeKey, coreStatus, version, beginnerMode, onSel
       </div>
     </Sider>
   );
-}
-
-function uniqueOpenKeys(openKeys: AppNavGroupKey[], activeParentKey?: AppNavGroupKey) {
-  if (!activeParentKey) return openKeys;
-  if (openKeys.includes(activeParentKey)) return openKeys;
-  return [...openKeys, activeParentKey];
-}
-
-function isNavGroupKey(key: string): key is AppNavGroupKey {
-  return key === "network" || key === "environment" || key === "diagnostics";
 }
 
 interface AppHeaderProps {

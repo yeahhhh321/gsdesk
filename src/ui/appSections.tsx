@@ -1,14 +1,16 @@
 import type { ReactNode } from "react";
-import { ExternalLink, FileArchive, Gauge, Globe, HardDrive, Settings, Terminal } from "lucide-react";
+import { ExternalLink, FileArchive, Gauge, Globe, HardDrive, RefreshCw, Settings, Terminal, Wrench } from "lucide-react";
 
 export type AppRouteKey =
   | "overview"
   | "webconsole"
   | "logs"
   | "settings"
+  | "shell_update"
   | "network_settings"
   | "network_checks"
   | "environment_runtime"
+  | "environment_repair"
   | "environment_update"
   | "environment_data"
   | "environment_tasks"
@@ -16,7 +18,6 @@ export type AppRouteKey =
   | "diagnostics_failures";
 
 export type AppSectionKey = AppRouteKey;
-export type AppNavGroupKey = "network" | "environment" | "diagnostics";
 
 interface AppRoute {
   key: AppRouteKey;
@@ -25,15 +26,6 @@ interface AppRoute {
   description: string;
 }
 
-interface AppNavGroup {
-  key: AppNavGroupKey;
-  icon: ReactNode;
-  label: string;
-  children: AppRoute[];
-}
-
-type AppNavEntry = AppRoute | AppNavGroup;
-
 export const appRoutes: AppRoute[] = [
   { key: "overview", icon: <Gauge size={18} />, label: "运行总控台", description: "管理 Core 状态、启动入口和首启流程" },
   { key: "webconsole", icon: <ExternalLink size={18} />, label: "WebConsole", description: "打开 gsuid_core 自带 WebConsole" },
@@ -41,8 +33,14 @@ export const appRoutes: AppRoute[] = [
   {
     key: "settings",
     icon: <Settings size={18} />,
-    label: "设置",
-    description: "管理 GSDesk 版本、壳更新、窗口关闭和后台运行策略",
+    label: "偏好设置",
+    description: "管理使用模式、窗口关闭和自动检查策略",
+  },
+  {
+    key: "shell_update",
+    icon: <RefreshCw size={18} />,
+    label: "壳更新",
+    description: "检查并安装 GSDesk 壳更新",
   },
   {
     key: "network_settings",
@@ -59,8 +57,14 @@ export const appRoutes: AppRoute[] = [
   {
     key: "environment_runtime",
     icon: <HardDrive size={18} />,
-    label: "预检修复",
-    description: "检查系统、工具链、端口、权限、磁盘、Core 源码和 venv",
+    label: "环境预检",
+    description: "查看系统、工具链、端口、权限、磁盘和运行时阻断项",
+  },
+  {
+    key: "environment_repair",
+    icon: <Wrench size={18} />,
+    label: "运行时修复",
+    description: "准备 uv、初始化 Core 运行时并执行依赖修复",
   },
   {
     key: "environment_update",
@@ -71,15 +75,15 @@ export const appRoutes: AppRoute[] = [
   {
     key: "environment_data",
     icon: <HardDrive size={18} />,
-    label: "数据维护",
-    description: "处理运行时备份、设置迁移、目录打开和本机数据清理",
+    label: "运行时备份",
+    description: "导出、恢复或清理 GSDesk 运行时数据",
   },
   { key: "environment_tasks", icon: <HardDrive size={18} />, label: "任务历史", description: "查看初始化、启动、停止和修复任务" },
   {
     key: "diagnostics_export",
     icon: <FileArchive size={18} />,
-    label: "诊断更新",
-    description: "导出诊断包并检查 GSDesk 壳更新",
+    label: "诊断导出",
+    description: "生成本机诊断包",
   },
   {
     key: "diagnostics_failures",
@@ -89,70 +93,32 @@ export const appRoutes: AppRoute[] = [
   },
 ];
 
-const standaloneRoutes = appRoutes.filter((route) => ["overview", "webconsole", "logs", "settings"].includes(route.key));
-
-const networkRoutes = appRoutes.filter((route) => route.key.startsWith("network_"));
-const environmentRoutes = appRoutes.filter((route) => route.key.startsWith("environment_"));
-const diagnosticsRoutes = appRoutes.filter((route) => route.key.startsWith("diagnostics_"));
 const beginnerRouteKeys = new Set<AppRouteKey>([
   "overview",
   "webconsole",
   "logs",
   "settings",
+  "shell_update",
   "network_checks",
   "environment_runtime",
+  "environment_repair",
   "environment_tasks",
   "diagnostics_export",
   "diagnostics_failures",
 ]);
-
-export const appNavigation: AppNavEntry[] = [
-  ...standaloneRoutes,
-  { key: "network", icon: <Globe size={18} />, label: "网络与源", children: networkRoutes },
-  { key: "environment", icon: <HardDrive size={18} />, label: "环境与修复", children: environmentRoutes },
-  { key: "diagnostics", icon: <FileArchive size={18} />, label: "诊断导出", children: diagnosticsRoutes },
-];
 
 export const sectionMeta = Object.fromEntries(appRoutes.map((section) => [section.key, section])) as Record<
   AppRouteKey,
   AppRoute
 >;
 
-export const routeParentKey = Object.fromEntries(
-  appNavigation.flatMap((entry) => ("children" in entry ? entry.children.map((child) => [child.key, entry.key]) : [])),
-) as Partial<Record<AppRouteKey, AppNavGroupKey>>;
-
-const navItems = appNavigation.map((entry) => {
-  return navItemForEntry(entry);
-});
+const navItems = appRoutes.map(navItemForRoute);
 
 export function navItemsForMode(beginnerMode: boolean) {
   if (!beginnerMode) return navItems;
-  return appNavigation.flatMap((entry) => {
-    if (!("children" in entry)) {
-      return beginnerRouteKeys.has(entry.key) ? [navItemForEntry(entry)] : [];
-    }
-    const children = entry.children.filter((child) => beginnerRouteKeys.has(child.key));
-    if (!children.length) return [];
-    return [
-      {
-        key: entry.key,
-        icon: entry.icon,
-        label: entry.label,
-        children: children.map(({ key, label }) => ({ key, label })),
-      },
-    ];
-  });
+  return appRoutes.filter((route) => beginnerRouteKeys.has(route.key)).map(navItemForRoute);
 }
 
-function navItemForEntry(entry: AppNavEntry) {
-  if ("children" in entry) {
-    return {
-      key: entry.key,
-      icon: entry.icon,
-      label: entry.label,
-      children: entry.children.map(({ key, label }) => ({ key, label })),
-    };
-  }
-  return { key: entry.key, icon: entry.icon, label: entry.label };
+function navItemForRoute(route: AppRoute) {
+  return { key: route.key, icon: route.icon, label: route.label };
 }

@@ -13,20 +13,16 @@ const pythonInstallDir = path.join(buildDir, "python-install");
 const cacheDir = path.join(root, "src-tauri", "target", "runtime-asset-cache", "uv");
 const gitCacheDir = path.join(root, "src-tauri", "target", "runtime-asset-cache", "git");
 const pythonTarget = "3.12";
+const uvPackageVersion = "0.9.8";
 const uvTargetName = process.platform === "win32" ? "uv.exe" : "uv";
 
 ensureDir(pythonDir);
 ensureDir(gitDir);
-const bundledPython = findPythonBinary(pythonDir);
-if (!bundledPython) {
-  throw new Error(`Bundled Python ${pythonTarget} is required before updating runtime assets: ${pythonDir}`);
-}
-const gitAsset = await prepareGitAsset();
-resetDir(bootstrapUvRoot);
 ensureDir(cacheDir);
-const uvPath = createUvFromBundledPython(bundledPython, bootstrapUvRoot);
-const uvVersion = runText(uvPath, ["--version"]);
-console.log(`[runtime-assets] using ${uvVersion} from bundled Python`);
+const bootstrapUv = resolveBootstrapUv();
+const bootstrapUvVersion = runText(bootstrapUv, ["--version"]);
+console.log(`[runtime-assets] using bootstrap ${bootstrapUvVersion}`);
+const gitAsset = await prepareGitAsset();
 
 cleanGeneratedDir(pythonDir);
 resetDir(pythonInstallDir);
@@ -38,7 +34,7 @@ const installEnv = {
 };
 delete installEnv.UV_PYTHON_DOWNLOADS;
 
-run(uvPath, ["python", "install", pythonTarget, "--install-dir", pythonInstallDir, "--no-bin"], installEnv);
+run(bootstrapUv, ["python", "install", pythonTarget, "--install-dir", pythonInstallDir, "--no-bin"], installEnv);
 
 copyDirContents(pythonInstallDir, pythonDir);
 removeIfExists(path.join(pythonDir, ".temp"));
@@ -60,13 +56,22 @@ if (installNames.length === 0) {
   throw new Error(`Bundled Python ${pythonTarget} install directory is missing under ${pythonDir}`);
 }
 
+resetDir(bootstrapUvRoot);
+const uvPath = createUvFromBundledPython(pythonBinary, bootstrapUvRoot);
+const uvVersion = runText(uvPath, ["--version"]);
+console.log(`[runtime-assets] verified ${uvVersion} from bundled Python`);
+
 const manifest = {
   schema: "gsdesk-runtime-assets-v1",
   generatedAt: new Date().toISOString(),
   platform: os.platform(),
   arch: os.arch(),
+  generator: {
+    uv: bootstrapUvVersion,
+  },
   uvBootstrap: {
     package: "uv",
+    packageVersion: uvPackageVersion,
     source: "bundled-python-venv",
     version: uvVersion,
   },
@@ -79,6 +84,26 @@ const manifest = {
 fs.writeFileSync(path.join(assetsDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
 console.log(`[runtime-assets] bundled ${manifest.pythonBinary}`);
 fs.rmSync(buildDir, { recursive: true, force: true });
+
+function resolveBootstrapUv() {
+  const configured = process.env.GSDESK_BOOTSTRAP_UV;
+  if (configured) {
+    return configured;
+  }
+  if (commandAvailable("uv", ["--version"])) {
+    return "uv";
+  }
+  throw new Error("生成运行时资源前需要可执行 uv；请先安装 uv==0.9.8 或设置 GSDESK_BOOTSTRAP_UV。");
+}
+
+function commandAvailable(program, args) {
+  try {
+    runText(program, args);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function createUvFromBundledPython(sourcePython, targetRoot) {
   const pipEnv = {
@@ -96,7 +121,7 @@ function createUvFromBundledPython(sourcePython, targetRoot) {
     throw new Error(`uv bootstrap venv was created without Python: ${targetRoot}`);
   }
   run(venvPython, ["-m", "ensurepip", "--upgrade"], pipEnv);
-  run(venvPython, ["-m", "pip", "install", "--upgrade", "uv"], pipEnv);
+  run(venvPython, ["-m", "pip", "install", "--upgrade", `uv==${uvPackageVersion}`], pipEnv);
   const uvExecutable = path.join(targetRoot, scriptsDirName(), uvTargetName);
   if (!fs.existsSync(uvExecutable)) {
     throw new Error(`uv was installed but executable is missing: ${uvExecutable}`);

@@ -10,7 +10,9 @@
 2. 执行格式、lint、前端构建、Rust 测试。
 3. 执行安全和 bundle 配置脚本。
 4. 执行 `pnpm tauri build --no-bundle`。
-5. 生成平台安装包后执行 release asset 校验。
+5. 在 clean checkout 语义下执行 `pnpm prepare:runtime-assets`；该脚本必须能从构建机 `uv` 自举 CPython 资源，不能依赖 Git 已跟踪的 Python 目录。
+6. 生成平台安装包后执行 release asset 校验。
+7. GitHub Actions 只能先写 draft release；所有平台构建和 checksum artifact 完成后，由 `publish` job 统一转为正式 Release。
 
 ## 命令
 
@@ -19,6 +21,7 @@ pnpm precommit
 pnpm verify:security
 pnpm verify:bundle-config
 pnpm tauri build --no-bundle
+pnpm prepare:runtime-assets
 pnpm verify:release-assets -- --dir release-assets --platform windows --write
 ```
 

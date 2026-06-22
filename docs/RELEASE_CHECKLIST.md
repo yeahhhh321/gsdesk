@@ -88,6 +88,7 @@ git push origin v0.1.0
 ```
 
 5. 等待 GitHub Actions `Release` workflow 完成。
+   - matrix 构建阶段只允许写入 draft release；全部平台通过后，`publish` job 才能附加 checksum 并转为正式 Release。
 6. 检查已发布 Release 产物：
    - Windows NSIS 安装包
    - Windows `.exe.sig`
