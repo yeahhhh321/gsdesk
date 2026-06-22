@@ -76,6 +76,7 @@ export default function OverviewPage({
   const portPolicy = `固定 ${appState?.settings.preferredCorePort ?? 8765}`;
   const networkItems = appState ? createNetworkItems(appState.settings, sourceResults, mirrorResults) : [];
   const toolItems = appState ? createToolItems(appState.toolchain, appState.uvDetected) : [];
+  const setupComplete = setupChecklist.length > 0 && setupChecklist.every((step) => step.done);
   const lifecycleAction = getLifecycleAction(coreStatus);
   const lifecycleLoading = Boolean(lifecycleAction.loadingKey && loadingAction === lifecycleAction.loadingKey);
   const runLifecycleAction = lifecycleAction.kind === "stop" ? onStopCore : onStartCore;
@@ -200,11 +201,16 @@ export default function OverviewPage({
               </div>
             </div>
           </div>
-          <div className="overview-control-guide" aria-label="首次安装引导">
+          <div className={`overview-control-guide${setupComplete ? " is-complete" : ""}`} aria-label="首次安装引导">
             <div className="overview-control-section-head">
               <div>
-                <strong>首次安装引导</strong>
-                <small>按顺序完成预检、源、运行时和 WebConsole</small>
+                <span className="overview-guide-title-line">
+                  <strong>首次安装引导</strong>
+                  {setupComplete && <span className="overview-guide-complete-badge">已完成</span>}
+                </span>
+                <small>
+                  {setupComplete ? "环境、源、运行时和 WebConsole 均已就绪" : "按顺序完成预检、源、运行时和 WebConsole"}
+                </small>
               </div>
               <Button size="small" type="primary" icon={<Wrench size={14} />} onClick={() => onOpenInstallGuide(0)}>
                 打开引导

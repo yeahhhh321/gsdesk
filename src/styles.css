@@ -330,6 +330,13 @@ select {
   border-top: 1px solid var(--color-border-soft);
 }
 
+.overview-control-guide.is-complete {
+  padding: 10px;
+  border: 1px solid var(--color-success-border);
+  border-radius: var(--radius-control);
+  background: var(--color-success-bg);
+}
+
 .overview-control-section-head {
   min-width: 0;
   display: grid;
@@ -345,6 +352,24 @@ select {
 .overview-control-section-head strong {
   color: var(--color-muted-strong);
   font-size: 14px;
+}
+
+.overview-guide-title-line {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.overview-guide-complete-badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--color-success);
+  color: var(--color-surface);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.5;
 }
 
 .overview-control-section-head small {
