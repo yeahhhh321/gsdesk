@@ -153,6 +153,22 @@ export default function OverviewPage({
             </Button>
           </SectionActions>
         </div>
+        <div className="overview-control-details" aria-label="网络与工具">
+          <div className="overview-control-detail-head">
+            <strong>网络与工具</strong>
+            <small>只展示当前网络源和本地工具状态，处理入口仍在检测处理</small>
+          </div>
+          <div className="overview-control-detail-groups">
+            <div className="overview-subsection">
+              <strong>网络</strong>
+              <OverviewInfoGrid items={networkItems} />
+            </div>
+            <div className="overview-subsection">
+              <strong>工具</strong>
+              <OverviewInfoGrid items={toolItems} />
+            </div>
+          </div>
+        </div>
         {nextAction && (
           <Alert
             className="overview-next-action"
@@ -199,18 +215,6 @@ export default function OverviewPage({
           {hiddenPreflightCount > 0 && (
             <p className="overview-more-line">另有 {hiddenPreflightCount} 项通过或在环境预检页查看。</p>
           )}
-        </div>
-      </div>
-
-      <div className="wide-panel overview-settings-panel overview-compact-panel">
-        <PanelHeader title="网络与工具" description="只展示当前网络源和本地工具状态，处理入口仍在检测处理" />
-        <div className="overview-subsection">
-          <strong>网络</strong>
-          <OverviewInfoGrid items={networkItems} />
-        </div>
-        <div className="overview-subsection">
-          <strong>工具</strong>
-          <OverviewInfoGrid items={toolItems} />
         </div>
       </div>
 

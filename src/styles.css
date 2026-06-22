@@ -198,14 +198,6 @@ select {
   grid-column: 1 / -1;
 }
 
-.overview-settings-panel {
-  grid-row: span 2;
-}
-
-.overview-guide-panel {
-  grid-column: 1;
-}
-
 .overview-dashboard .panel-title-row {
   align-items: center;
   gap: 10px;
@@ -301,6 +293,55 @@ select {
 .overview-control-grid > .section-actions {
   align-content: center;
   justify-content: flex-end;
+}
+
+.overview-control-details {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.overview-control-detail-head {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.overview-control-detail-head strong {
+  color: var(--color-muted-strong);
+  font-size: 14px;
+}
+
+.overview-control-detail-head small {
+  min-width: 0;
+  color: var(--color-muted);
+}
+
+.overview-control-detail-groups {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(240px, 0.46fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.overview-control-detail-groups .overview-subsection + .overview-subsection {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: 0;
+}
+
+.overview-control-details .overview-subsection:first-child .overview-info-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.overview-control-details .overview-subsection:last-child .overview-info-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .overview-subsection {
@@ -1375,13 +1416,12 @@ select {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .overview-settings-panel,
-  .overview-guide-panel {
-    grid-column: auto;
-    grid-row: auto;
+  .overview-control-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 
-  .overview-control-grid {
+  .overview-control-details,
+  .overview-control-detail-groups {
     grid-template-columns: minmax(0, 1fr);
   }
 
@@ -1567,6 +1607,8 @@ select {
   .overview-compact-status-grid,
   .health-overview,
   .overview-info-grid,
+  .overview-control-details .overview-subsection:first-child .overview-info-grid,
+  .overview-control-details .overview-subsection:last-child .overview-info-grid,
   .settings-summary-grid,
   .overview-guide-panel .wizard-line,
   .wizard-line,
