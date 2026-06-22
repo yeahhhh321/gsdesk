@@ -27,6 +27,8 @@ function App() {
             appState={controller.appState}
             core={controller.core}
             setupChecklist={controller.setupChecklist}
+            sourceResults={controller.sourceResults}
+            mirrorResults={controller.mirrorResults}
             loadingAction={controller.loadingAction}
             onStartCore={controller.startCore}
             onStopCore={controller.stopCore}

@@ -133,22 +133,28 @@ function SourceCheckBlock({
   lastCheckedAt,
   loadingAction,
   onProbeSources,
+  compact = false,
 }: {
   results: SourceProbeResult[];
   lastCheckedAt?: string;
   loadingAction?: string;
   onProbeSources: () => void;
+  compact?: boolean;
 }) {
+  const blockClassName = `network-check-block${compact ? " is-compact" : ""}${results.length > 0 ? " has-results" : ""}`;
+
   return (
-    <div className="network-check-block">
+    <div className={blockClassName}>
       <div className="network-check-header">
         <div className="network-check-copy">
           <strong>源码检测</strong>
           <Text type="secondary">上次检测：{formatTime(lastCheckedAt)}</Text>
         </div>
-        <Button icon={<Activity size={16} />} loading={loadingAction === "probe_sources"} onClick={onProbeSources}>
-          检测源码源
-        </Button>
+        {!compact && (
+          <Button icon={<Activity size={16} />} loading={loadingAction === "probe_sources"} onClick={onProbeSources}>
+            检测源码源
+          </Button>
+        )}
       </div>
       {results.length > 0 ? (
         <Table rowKey="id" columns={sourceColumns} dataSource={results} pagination={false} size="small" />
@@ -164,22 +170,28 @@ function MirrorCheckBlock({
   lastCheckedAt,
   loadingAction,
   onCheckMirrors,
+  compact = false,
 }: {
   results: MirrorCheckResult[];
   lastCheckedAt?: string;
   loadingAction?: string;
   onCheckMirrors: () => void;
+  compact?: boolean;
 }) {
+  const blockClassName = `network-check-block${compact ? " is-compact" : ""}${results.length > 0 ? " has-results" : ""}`;
+
   return (
-    <div className="network-check-block">
+    <div className={blockClassName}>
       <div className="network-check-header">
         <div className="network-check-copy">
           <strong>PyPI 测速</strong>
           <Text type="secondary">上次检测：{formatTime(lastCheckedAt)}</Text>
         </div>
-        <Button icon={<Activity size={16} />} loading={loadingAction === "check_mirrors"} onClick={onCheckMirrors}>
-          测速 PyPI
-        </Button>
+        {!compact && (
+          <Button icon={<Activity size={16} />} loading={loadingAction === "check_mirrors"} onClick={onCheckMirrors}>
+            测速 PyPI
+          </Button>
+        )}
       </div>
       {results.length > 0 ? (
         <Table rowKey="url" columns={mirrorColumns} dataSource={results} pagination={false} size="small" />
@@ -250,27 +262,45 @@ function NetworkSettingsForm({
 }) {
   const [form] = Form.useForm<NetworkFormValues>();
   const userEditedRef = useRef(false);
+  const latestValuesRef = useRef<NetworkFormValues>(networkFormValues(settings));
 
   useEffect(() => {
     if (userEditedRef.current) return;
-    form.setFieldsValue(networkFormValues(settings));
+    const values = networkFormValues(settings);
+    latestValuesRef.current = values;
+    form.setFieldsValue(values);
   }, [form, settings]);
+
+  function rememberNetworkValues(values: Partial<NetworkFormValues>) {
+    latestValuesRef.current = { ...latestValuesRef.current, ...values };
+  }
+
+  function handleNetworkValuesChange(_: Partial<NetworkFormValues>, values: NetworkFormValues) {
+    userEditedRef.current = true;
+    rememberNetworkValues(values);
+  }
 
   return (
     <Form
       form={form}
       layout="vertical"
       initialValues={networkFormValues(settings)}
-      onValuesChange={() => {
-        userEditedRef.current = true;
-      }}
-      onFinish={(values) => onSubmit(mergeNetworkFormValues(settings, values))}
+      onValuesChange={handleNetworkValuesChange}
+      onFinish={(values) => onSubmit(mergeNetworkFormValues(settings, { ...latestValuesRef.current, ...values }))}
       className="settings-form network-settings-form"
     >
-      <div className="network-settings-layout">
-        <fieldset className="settings-group">
-          <legend>源码源</legend>
-          <div className="settings-group-grid source-settings-grid">
+      <div className="network-settings-board">
+        <section className="network-settings-section">
+          <div className="network-section-head">
+            <div className="network-section-title">
+              <strong>源码源</strong>
+              <Text type="secondary">自动选择可用 Git 源，异常时可手动锁定。</Text>
+            </div>
+            <Button icon={<Activity size={16} />} loading={loadingAction === "probe_sources"} onClick={onProbeSources}>
+              检测源码源
+            </Button>
+          </div>
+          <div className="network-section-fields source-settings-grid">
             <Form.Item name="sourceMode" label="源码源策略">
               <Radio.Group>
                 <Radio.Button value="auto">自动选择</Radio.Button>
@@ -287,12 +317,21 @@ function NetworkSettingsForm({
             lastCheckedAt={settings.lastSourceProbeAt}
             loadingAction={loadingAction}
             onProbeSources={onProbeSources}
+            compact
           />
-        </fieldset>
+        </section>
 
-        <fieldset className="settings-group">
-          <legend>PyPI 镜像</legend>
-          <div className="settings-group-grid pypi-settings-grid">
+        <section className="network-settings-section">
+          <div className="network-section-head">
+            <div className="network-section-title">
+              <strong>PyPI 镜像</strong>
+              <Text type="secondary">安装 Python 依赖和 Playwright 浏览器时使用。</Text>
+            </div>
+            <Button icon={<Activity size={16} />} loading={loadingAction === "check_mirrors"} onClick={onCheckMirrors}>
+              测速 PyPI
+            </Button>
+          </div>
+          <div className="network-section-fields pypi-settings-grid">
             <Form.Item name="pypiIndexMode" label="PyPI 镜像策略" extra="自动测速保存最快镜像；手动锁定只记录结果。">
               <Radio.Group>
                 <Radio.Button value="auto">自动选择</Radio.Button>
@@ -315,11 +354,12 @@ function NetworkSettingsForm({
             lastCheckedAt={settings.lastMirrorCheckAt}
             loadingAction={loadingAction}
             onCheckMirrors={onCheckMirrors}
+            compact
           />
-        </fieldset>
+        </section>
       </div>
       <div className="settings-form-actions">
-        <Button type="primary" htmlType="submit">
+        <Button type="primary" htmlType="submit" loading={loadingAction === "save_settings"}>
           保存设置
         </Button>
       </div>
@@ -402,12 +442,24 @@ function CorePathForm({
 }) {
   const [form] = Form.useForm<CorePathFormValues>();
   const userEditedRef = useRef(false);
+  const latestValuesRef = useRef<CorePathFormValues>(corePathFormValues(settings));
   const corePluginsDir = joinPath(activeCoreDir, "plugins");
 
   useEffect(() => {
     if (userEditedRef.current) return;
-    form.setFieldsValue(corePathFormValues(settings));
+    const values = corePathFormValues(settings);
+    latestValuesRef.current = values;
+    form.setFieldsValue(values);
   }, [form, settings]);
+
+  function rememberCorePathValues(values: Partial<CorePathFormValues>) {
+    latestValuesRef.current = { ...latestValuesRef.current, ...values };
+  }
+
+  function handleCorePathValuesChange(_: Partial<CorePathFormValues>, values: CorePathFormValues) {
+    userEditedRef.current = true;
+    rememberCorePathValues(values);
+  }
 
   async function pickCoreDir() {
     const currentValue = form.getFieldValue("customCoreDir");
@@ -415,6 +467,7 @@ function CorePathForm({
     const selected = await onSelectDirectory(defaultPath);
     if (selected) {
       userEditedRef.current = true;
+      rememberCorePathValues({ customCoreDir: selected });
       form.setFieldValue("customCoreDir", selected);
     }
   }
@@ -424,10 +477,8 @@ function CorePathForm({
       form={form}
       layout="vertical"
       initialValues={corePathFormValues(settings)}
-      onValuesChange={() => {
-        userEditedRef.current = true;
-      }}
-      onFinish={(values) => onSubmit(mergeCorePathFormValues(settings, values))}
+      onValuesChange={handleCorePathValuesChange}
+      onFinish={(values) => onSubmit(mergeCorePathFormValues(settings, { ...latestValuesRef.current, ...values }))}
       className="settings-form network-settings-form"
     >
       <div className="network-settings-layout">

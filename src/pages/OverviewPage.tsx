@@ -1,12 +1,28 @@
 import type { ReactNode } from "react";
 import { Alert, Button, Typography } from "antd";
 import { ExternalLink, ListChecks, Play, Square, Terminal, Wrench } from "lucide-react";
-import { displayNumber, displaySecondsFromMilliseconds, displayText } from "../ui/format";
+import {
+  displayMegabytesPerSecond,
+  displayMilliseconds,
+  displayNumber,
+  displaySecondsFromMilliseconds,
+  displayText,
+} from "../ui/format";
 import { PanelHeader, SectionActions } from "../ui/primitives";
 import { statusText } from "../ui/status";
 import { PreflightStatusTag, StatusTag, TaskStatusTag } from "../ui/statusTags";
 import { isBeginnerMode } from "../ui/userMode";
-import type { AppState, PreflightCheck, ServiceSnapshot, ServiceStatus, Settings, TaskRecord, ToolchainInfo } from "../types";
+import type {
+  AppState,
+  MirrorCheckResult,
+  PreflightCheck,
+  ServiceSnapshot,
+  ServiceStatus,
+  Settings,
+  SourceProbeResult,
+  TaskRecord,
+  ToolchainInfo,
+} from "../types";
 import type { SetupProgressItem } from "../ui/setupProgress";
 
 const { Text } = Typography;
@@ -15,6 +31,8 @@ interface OverviewPageProps {
   appState?: AppState;
   core?: ServiceSnapshot;
   setupChecklist: SetupProgressItem[];
+  sourceResults: SourceProbeResult[];
+  mirrorResults: MirrorCheckResult[];
   loadingAction?: string;
   onStartCore: () => void;
   onStopCore: () => void;
@@ -32,6 +50,8 @@ export default function OverviewPage({
   appState,
   core,
   setupChecklist,
+  sourceResults,
+  mirrorResults,
   loadingAction,
   onStartCore,
   onStopCore,
@@ -54,7 +74,8 @@ export default function OverviewPage({
   const compactTasks = beginnerMode ? [] : taskHistory.slice(0, TASK_LIMIT);
   const hiddenTaskCount = Math.max(taskHistory.length - compactTasks.length, 0);
   const portPolicy = `固定 ${appState?.settings.preferredCorePort ?? 8765}`;
-  const settingsItems = appState ? createSettingsItems(appState.settings, appState.toolchain, beginnerMode) : [];
+  const networkItems = appState ? createNetworkItems(appState.settings, sourceResults, mirrorResults) : [];
+  const toolItems = appState ? createToolItems(appState.toolchain, appState.uvDetected) : [];
   const lifecycleAction = getLifecycleAction(coreStatus);
   const lifecycleLoading = Boolean(lifecycleAction.loadingKey && loadingAction === lifecycleAction.loadingKey);
   const runLifecycleAction = lifecycleAction.kind === "stop" ? onStopCore : onStartCore;
@@ -99,9 +120,14 @@ export default function OverviewPage({
               detail={visiblePreflight.length ? "按阻断优先排序" : "等待状态刷新"}
             />
             <OverviewMetric
-              label="Commit"
-              value={displayText(core?.currentCommit, "-")}
-              detail={displayText(core?.currentTag, "无 tag")}
+              label="源码源"
+              value={sourceModeText(appState?.settings.sourceMode ?? "auto")}
+              detail={sourceProbeSummary(sourceResults)}
+            />
+            <OverviewMetric
+              label="PyPI"
+              value={pypiModeText(appState?.settings.pypiIndexMode ?? "auto")}
+              detail={mirrorProbeSummary(mirrorResults)}
             />
             <OverviewMetric label="工具链" value={toolchainStatus(appState)} detail={toolchainDetail(appState)} />
             {!beginnerMode && (
@@ -177,8 +203,15 @@ export default function OverviewPage({
       </div>
 
       <div className="wide-panel overview-settings-panel overview-compact-panel">
-        <PanelHeader title={beginnerMode ? "当前自动配置" : "网络与策略"} />
-        <OverviewInfoGrid items={settingsItems} />
+        <PanelHeader title="网络与工具" description="只展示当前网络源和本地工具状态，处理入口仍在检测处理" />
+        <div className="overview-subsection">
+          <strong>网络</strong>
+          <OverviewInfoGrid items={networkItems} />
+        </div>
+        <div className="overview-subsection">
+          <strong>工具</strong>
+          <OverviewInfoGrid items={toolItems} />
+        </div>
       </div>
 
       {!beginnerMode && (
@@ -275,48 +308,52 @@ function OverviewInfoGrid({ items }: { items: OverviewInfoItem[] }) {
   );
 }
 
-function createSettingsItems(settings: Settings, toolchain: ToolchainInfo, beginnerMode: boolean): OverviewInfoItem[] {
-  if (beginnerMode) {
-    return [
-      { label: "使用模式", value: "小白模式", detail: "只显示直接可用的操作" },
-      {
-        label: "源码工具",
-        value: toolchain.gitDetected ? "已准备好" : "当前安装包不完整",
-        detail: toolchain.gitDetected ? gitSourceText(toolchain.gitSource) : displayText(toolchain.gitError, "缺少内置 Git"),
-      },
-      {
-        label: "下载源",
-        value: sourceModeText(settings.sourceMode),
-        detail: displayText(settings.selectedSource, "自动选择可用源"),
-      },
-      { label: "PyPI", value: pypiModeText(settings.pypiIndexMode), detail: displayText(settings.pypiIndexUrl, "自动选择镜像") },
-      {
-        label: "端口",
-        value: `固定 ${settings.preferredCorePort ?? 8765}`,
-        detail: "默认 8765",
-      },
-      { label: "关闭窗口", value: settings.hideToTrayOnClose ? "隐藏到托盘" : "退出 GSDesk" },
-    ];
-  }
-
+function createNetworkItems(
+  settings: Settings,
+  sourceResults: SourceProbeResult[],
+  mirrorResults: MirrorCheckResult[],
+): OverviewInfoItem[] {
   return [
     {
-      label: "源码工具",
-      value: toolchain.gitDetected ? gitSourceText(toolchain.gitSource) : "不可用",
-      detail: toolchain.gitDetected ? displayText(toolchain.gitVersion, "Git 可用") : displayText(toolchain.gitError, "缺少 Git"),
+      label: "源码源",
+      value: sourceModeText(settings.sourceMode),
+      detail: `${sourceProbeSummary(sourceResults)} · ${sourceResults.length ? sourceBestDetail(sourceResults) : displayText(settings.selectedSource, "自动选择可用源")}`,
     },
-    { label: "源码源", value: sourceModeText(settings.sourceMode), detail: displayText(settings.selectedSource, "未设置源码源") },
-    { label: "PyPI", value: pypiModeText(settings.pypiIndexMode), detail: displayText(settings.pypiIndexUrl, "未设置镜像") },
     {
-      label: "端口",
-      value: `固定 ${settings.preferredCorePort ?? 8765}`,
-      detail: "启动时严格使用该端口",
+      label: "PyPI",
+      value: pypiModeText(settings.pypiIndexMode),
+      detail: `${mirrorProbeSummary(mirrorResults)} · ${mirrorResults.length ? mirrorBestDetail(mirrorResults) : displayText(settings.pypiIndexUrl, "自动选择镜像")}`,
     },
-    { label: "代理", value: proxySummary(settings.proxy), detail: "HTTP / HTTPS / ALL / NO_PROXY" },
+  ];
+}
+
+function createToolItems(toolchain: ToolchainInfo, uvDetected: boolean): OverviewInfoItem[] {
+  return [
     {
-      label: "退出时 Core",
-      value: settings.closeCoreOnExit ? "关闭" : "后台保留",
-      detail: settings.hideToTrayOnClose ? "窗口隐藏到托盘" : "窗口关闭即退出",
+      label: "Git",
+      value: toolchain.gitDetected ? "可用" : "缺失",
+      detail: toolchain.gitDetected
+        ? `${gitSourceText(toolchain.gitSource)} · ${displayText(toolchain.gitVersion, "Git")}`
+        : displayText(toolchain.gitError, "缺少 Git"),
+    },
+    {
+      label: "uv",
+      value: uvDetected ? "可用" : "缺失",
+      detail: uvDetected
+        ? `${displayText(toolchain.uvVersion, "uv")} · ${toolchain.uvSource}`
+        : displayText(toolchain.uvError, "可一键安装"),
+    },
+    {
+      label: "Python",
+      value: toolchain.bundledPythonAvailable ? "内置可用" : "未内置",
+      detail: displayText(toolchain.bundledPythonPath, "正式包会内置"),
+    },
+    {
+      label: "Playwright",
+      value: toolchain.playwrightDetected ? "已安装" : "未安装",
+      detail: toolchain.playwrightDetected
+        ? displayText(toolchain.playwrightBrowsersPath, "浏览器目录可用")
+        : displayText(toolchain.playwrightError, "可在检测处理安装"),
     },
   ];
 }
@@ -356,7 +393,38 @@ function toolchainDetail(appState?: AppState) {
   if (!appState) return "uv / Git";
   const uvText = appState.uvDetected ? "uv 可用" : "uv 缺失";
   const gitText = appState.toolchain.gitDetected ? "Git 可用" : "Git 缺失";
-  return `${uvText} · ${gitText}`;
+  const pythonText = appState.toolchain.bundledPythonAvailable ? "Python 可用" : "Python 缺失";
+  return `${uvText} · ${gitText} · ${pythonText}`;
+}
+
+function sourceProbeSummary(results: SourceProbeResult[]) {
+  if (!results.length) return "待检测";
+  const okCount = results.filter((item) => item.ok).length;
+  return okCount > 0 ? `${okCount}/${results.length} 可用` : "不可用";
+}
+
+function sourceBestDetail(results: SourceProbeResult[]) {
+  const best = results.find((item) => item.ok);
+  if (best) return `${best.name} · ${displayMilliseconds(best.latencyMs, "已连通")}`;
+  const firstError = results.find((item) => displayText(item.error, "").length > 0);
+  return displayText(firstError?.error, "没有可用源码源");
+}
+
+function mirrorProbeSummary(results: MirrorCheckResult[]) {
+  if (!results.length) return "待测速";
+  const okCount = results.filter((item) => item.ok).length;
+  return okCount > 0 ? `${okCount}/${results.length} 可用` : "不可用";
+}
+
+function mirrorBestDetail(results: MirrorCheckResult[]) {
+  const best = results.find((item) => item.ok);
+  if (best) {
+    const latency = displayMilliseconds(best.latencyMs, "已连通");
+    const speed = displayMegabytesPerSecond(best.speedMbps, "");
+    return speed.length ? `${best.name} · ${latency} · ${speed}` : `${best.name} · ${latency}`;
+  }
+  const firstError = results.find((item) => displayText(item.error, "").length > 0);
+  return displayText(firstError?.error, "没有可用 PyPI 镜像");
 }
 
 function sourceModeText(value: Settings["sourceMode"]) {
@@ -376,16 +444,6 @@ function gitSourceText(value?: string) {
 function pypiModeText(value: Settings["pypiIndexMode"]) {
   if (value === "manual") return "手动锁定";
   return "自动选择";
-}
-
-function proxySummary(proxy: Settings["proxy"]) {
-  const values = [proxy.httpProxy, proxy.httpsProxy, proxy.allProxy, proxy.noProxy];
-  let configuredCount = 0;
-  for (const value of values) {
-    if (displayText(value, "").length > 0) configuredCount += 1;
-  }
-  if (configuredCount > 0) return `${configuredCount} 项已设置`;
-  return "未设置";
 }
 
 function formatTime(value?: string) {

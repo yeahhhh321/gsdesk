@@ -187,6 +187,7 @@ select {
   grid-template-columns: minmax(0, 1.15fr) minmax(360px, 0.85fr);
   gap: 10px;
   align-items: start;
+  grid-auto-flow: dense;
 }
 
 .overview-dashboard .wide-panel {
@@ -195,6 +196,14 @@ select {
 
 .overview-control-strip {
   grid-column: 1 / -1;
+}
+
+.overview-settings-panel {
+  grid-row: span 2;
+}
+
+.overview-guide-panel {
+  grid-column: 1;
 }
 
 .overview-dashboard .panel-title-row {
@@ -294,6 +303,23 @@ select {
   justify-content: flex-end;
 }
 
+.overview-subsection {
+  min-width: 0;
+  display: grid;
+  gap: 7px;
+}
+
+.overview-subsection + .overview-subsection {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--color-border-soft);
+}
+
+.overview-subsection > strong {
+  color: var(--color-muted-strong);
+  font-size: 13px;
+}
+
 .overview-next-action {
   margin: 8px 0 0;
 }
@@ -372,14 +398,14 @@ select {
 }
 
 .overview-guide-panel .wizard-line {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 7px;
-  margin: 8px 0 0;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 6px 0 0;
 }
 
 .overview-guide-panel .wizard-step {
-  min-height: 42px;
-  padding: 7px 8px;
+  min-height: 38px;
+  padding: 6px 8px;
   gap: 6px;
   font-size: 12px;
 }
@@ -570,9 +596,26 @@ select {
   background: var(--color-panel-bg);
 }
 
+.network-check-block.is-compact {
+  padding: 9px 10px;
+  background: var(--color-surface);
+}
+
+.network-check-block.is-compact:not(.has-results) {
+  grid-template-columns: minmax(150px, 0.24fr) minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+}
+
+.network-check-block.is-compact:not(.has-results) .muted-block {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .network-check-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 10px;
   flex-wrap: wrap;
@@ -827,11 +870,57 @@ select {
   max-width: none;
 }
 
+.network-settings-board {
+  display: grid;
+  gap: 12px;
+}
+
 .network-settings-layout {
   display: grid;
   grid-template-columns: minmax(0, 1.1fr) minmax(300px, 0.9fr);
   gap: 16px 18px;
   align-items: start;
+}
+
+.network-settings-section {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--color-border-soft);
+  border-radius: var(--radius-control);
+  background: var(--color-panel-bg);
+}
+
+.network-section-head {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--color-border-soft);
+}
+
+.network-section-title {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.network-section-title strong {
+  color: var(--color-muted-strong);
+  font-size: 15px;
+}
+
+.network-section-fields {
+  display: grid;
+  gap: 10px 12px;
+  align-items: start;
+}
+
+.network-section-fields .ant-radio-group {
+  max-width: 100%;
 }
 
 .settings-group {
@@ -856,11 +945,11 @@ select {
 }
 
 .source-settings-grid {
-  grid-template-columns: minmax(220px, 0.72fr) minmax(280px, 1.28fr);
+  grid-template-columns: minmax(190px, 0.42fr) minmax(0, 1fr);
 }
 
 .pypi-settings-grid {
-  grid-template-columns: minmax(190px, 0.65fr) minmax(260px, 1fr) minmax(280px, 1.1fr);
+  grid-template-columns: minmax(220px, 0.46fr) minmax(220px, 0.74fr) minmax(260px, 0.8fr);
 }
 
 .core-settings-grid {
@@ -989,11 +1078,11 @@ select {
 }
 
 .install-guide-panel {
-  width: 760px;
+  width: min(920px, calc(100vw - 72px));
   max-width: calc(100vw - 48px);
   min-width: 0;
-  flex: 0 1 760px;
-  height: min(640px, calc(100vh - 48px));
+  flex: 0 1 920px;
+  height: min(700px, calc(100vh - 56px));
   max-height: calc(100vh - 48px);
   display: flex;
   flex-direction: column;
@@ -1008,7 +1097,7 @@ select {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 20px 24px 12px;
+  padding: 18px 24px 14px;
   border-bottom: 1px solid var(--color-border-soft);
 }
 
@@ -1020,7 +1109,22 @@ select {
   min-width: 0;
   flex: 1 1 auto;
   overflow: auto;
-  padding: 16px 24px;
+  padding: 14px 24px;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+}
+
+.install-guide-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.install-guide-scroll::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #cbd5e1;
+}
+
+.install-guide-scroll::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 .install-guide-overlay .ant-alert-message,
@@ -1045,26 +1149,84 @@ select {
 
 .install-guide-body {
   display: grid;
-  gap: 14px;
+  gap: 12px;
   min-width: 0;
 }
 
-.install-steps {
+.guide-top-strip {
   min-width: 0;
-  overflow-x: hidden;
-  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.install-step-rail {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 6px;
+  padding: 8px;
   border: 1px solid var(--color-border-soft);
   border-radius: var(--radius-control);
   background: var(--color-surface);
 }
 
-.install-steps .ant-steps-item {
-  flex: 1 0 0;
+.install-step-tab {
+  appearance: none;
   min-width: 0;
+  height: 36px;
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-muted);
+  text-align: left;
+  cursor: pointer;
 }
 
-.install-steps .ant-steps-item-title {
+.install-step-tab span {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--color-subtle-bg);
+  color: var(--color-muted-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.install-step-tab strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+  font-size: 13px;
+}
+
+.install-step-tab:hover,
+.install-step-tab.is-current {
+  border-color: var(--color-brand-border);
+  background: var(--color-brand-bg);
+  color: var(--color-brand-strong);
+}
+
+.install-step-tab.is-current span {
+  background: var(--color-brand);
+  color: var(--color-surface);
+}
+
+.install-step-tab.is-done span {
+  background: var(--color-success-bg);
+  color: var(--color-success);
+}
+
+.install-step-tab.is-error span {
+  background: #fff1f0;
+  color: #b42318;
 }
 
 .guide-run-all {
@@ -1072,7 +1234,7 @@ select {
   align-items: center;
   justify-content: space-between;
   gap: 14px;
-  padding: 12px 14px;
+  padding: 10px 12px;
   border: 1px solid var(--color-brand-border);
   border-radius: var(--radius-control);
   background: var(--color-brand-bg);
@@ -1088,25 +1250,37 @@ select {
   margin: 0;
 }
 
+.guide-running-alert.ant-alert {
+  padding: 8px 12px;
+}
+
 .guide-action-panel {
   display: grid;
-  gap: 14px;
+  gap: 12px;
   min-width: 0;
-  padding: 16px 18px;
+  padding: 14px 16px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-control);
   background: var(--color-panel-bg);
 }
 
+.guide-action-panel h5.ant-typography {
+  margin: 0;
+}
+
+.guide-action-panel > .muted-block {
+  margin: 0;
+}
+
 .guide-summary-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px;
 }
 
 .guide-summary-grid > div {
   min-width: 0;
-  padding: 10px;
+  padding: 8px 10px;
   border: 1px solid var(--color-border-soft);
   border-radius: var(--radius-control);
   background: var(--color-surface);
@@ -1123,7 +1297,7 @@ select {
 
 .guide-result-list {
   display: grid;
-  gap: 8px;
+  gap: 7px;
 }
 
 .guide-result-list > div {
@@ -1132,7 +1306,8 @@ select {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  padding: 9px 10px;
+  min-height: 44px;
+  padding: 7px 10px;
   border: 1px solid var(--color-border-soft);
   border-radius: var(--radius-control);
   background: var(--color-surface);
@@ -1171,7 +1346,7 @@ select {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
-  padding: 14px 24px 18px;
+  padding: 12px 24px 14px;
   border-top: 1px solid var(--color-border-soft);
   background: var(--color-surface);
 }
@@ -1198,6 +1373,12 @@ select {
 @media (max-width: 1180px) {
   .overview-dashboard {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .overview-settings-panel,
+  .overview-guide-panel {
+    grid-column: auto;
+    grid-row: auto;
   }
 
   .overview-control-grid {
@@ -1342,6 +1523,36 @@ select {
 
   .content {
     padding: 12px;
+  }
+
+  .install-guide-overlay {
+    padding: 12px;
+  }
+
+  .install-guide-panel {
+    width: calc(100vw - 24px);
+    max-width: calc(100vw - 24px);
+    height: calc(100vh - 24px);
+    max-height: calc(100vh - 24px);
+  }
+
+  .install-guide-header,
+  .install-guide-scroll,
+  .guide-footer {
+    padding-inline: 14px;
+  }
+
+  .guide-run-all {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .guide-run-all .ant-btn {
+    width: 100%;
+  }
+
+  .install-step-rail {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .page-block,

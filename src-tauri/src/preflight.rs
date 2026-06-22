@@ -202,12 +202,7 @@ fn check_fixed_port(port: u16, services: &[ServiceSnapshot]) -> PreflightCheck {
             ),
             "点击“强杀端口占用”，或改成其他可用端口",
         ),
-        Err(error) => block(
-            "port",
-            "固定端口",
-            format!("{port} 监听进程查询失败: {error}，固定端口模式不会自动切换"),
-            "重新检测端口；如果持续失败，检查系统网络命令权限",
-        ),
+        Err(error) => check_fixed_bind_state_after_query_error(port, &error),
     }
 }
 
@@ -222,6 +217,23 @@ fn check_fixed_bind_state(port: u16) -> PreflightCheck {
             "稍后重新检测端口，或改成其他可用端口",
         )
     }
+}
+
+fn check_fixed_bind_state_after_query_error(port: u16, error: &str) -> PreflightCheck {
+    if service_port_available(port) {
+        return warn(
+            "port",
+            "固定端口",
+            format!("{port} 可绑定，但监听进程查询失败: {error}"),
+            "可以继续启动；如果启动仍失败，检查系统网络命令权限",
+        );
+    }
+    block(
+        "port",
+        "固定端口",
+        format!("{port} 监听进程查询失败，且端口暂不可绑定: {error}，固定端口模式不会自动切换"),
+        "重新检测端口；如果持续失败，检查系统网络命令权限",
+    )
 }
 
 fn core_service_on_port(services: &[ServiceSnapshot], port: u16) -> Option<&ServiceSnapshot> {
@@ -481,6 +493,21 @@ mod tests {
             check.detail.contains("固定端口模式不会自动切换")
                 || check.detail.contains("暂不可绑定")
         );
+    }
+
+    #[test]
+    fn fixed_port_query_error_is_warning_when_port_can_bind() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let check = check_fixed_bind_state_after_query_error(port, "Get-NetTCPConnection 被拒绝");
+
+        assert_eq!(check.id, "port");
+        assert_eq!(check.label, "固定端口");
+        assert_eq!(check.status, "warn");
+        assert!(check.detail.contains("可绑定"));
+        assert!(check.action.unwrap().contains("继续启动"));
     }
 
     #[test]

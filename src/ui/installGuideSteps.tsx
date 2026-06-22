@@ -1,4 +1,4 @@
-import { Alert, Typography } from "antd";
+import { Alert, Tag, Typography } from "antd";
 import type { ReactNode } from "react";
 import { Activity, ArrowRight, Cable, CheckCircle2, ExternalLink, Play, Terminal, Wrench } from "lucide-react";
 import type { AppState, MirrorCheckResult, ServiceSnapshot, SourceProbeResult } from "../types";
@@ -98,8 +98,9 @@ export function buildGuideSteps({
             items={preflightIssues.map((item) => ({
               key: item.id,
               name: item.label,
-              detail: displayText(item.action, item.detail),
+              detail: preflightIssueDetail(item),
               ok: item.status !== "block",
+              warning: item.status === "warn",
             }))}
           />
         </>
@@ -338,7 +339,7 @@ function ResultList({
   items,
 }: {
   emptyText: string;
-  items: Array<{ key: string; name: string; detail: string; ok: boolean }>;
+  items: Array<{ key: string; name: string; detail: string; ok: boolean; warning?: boolean }>;
 }) {
   if (!items.length) return <p className="guide-empty">{emptyText}</p>;
   return (
@@ -348,11 +349,19 @@ function ResultList({
           {item.ok ? <CheckCircle2 size={16} className="guide-ok" /> : <span className="guide-error-dot" />}
           <strong>{item.name}</strong>
           <span className="guide-result-detail">{item.detail}</span>
-          <ResultTag ok={item.ok} />
+          {item.warning ? <Tag color="warning">警告</Tag> : <ResultTag ok={item.ok} />}
         </div>
       ))}
     </div>
   );
+}
+
+function preflightIssueDetail(item: AppState["preflightChecks"][number]) {
+  const detail = displayText(item.detail, "");
+  const action = displayText(item.action, "");
+  if (!detail) return displayText(action, "-");
+  if (!action) return detail;
+  return `${detail}；${action}`;
 }
 
 function getPreflightIssues(appState?: AppState) {
